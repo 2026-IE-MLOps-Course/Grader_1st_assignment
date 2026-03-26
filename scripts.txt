@@ -1,0 +1,26 @@
+python grader.py \
+  --config config.yaml \
+  --dimensions error_handling \
+  --output-dir outputs
+
+
+python grader.py \
+  --config config.yaml \
+  --dimensions error_handling \
+  --local-repo-path grading_workspace/clones/benchmark_repo_2026-IE-MLOps-Course_2-mlops-modularized-repo \
+  --output-dir outputs
+
+python grader.py \
+  --dimensions artifacting \
+  --config config.yaml \
+  --output-dir outputs \
+  --local-repo-path grading_workspace/clones/benchmark_repo_2026-IE-MLOps-Course_2-mlops-modularized-repo
+
+  python grader.py \
+  --config config.yaml \
+  --repos-file repos.txt \
+  --output-dir outputs
+
+  rm -rf grading_workspace  
+  mkdir -p grading_workspace 
+

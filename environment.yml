@@ -1,0 +1,35 @@
+name: grades
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - pip
+  - pandas
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - requests
+  - pyyaml
+  - python-dotenv
+  - joblib
+  - openpyxl
+  - pyarrow
+  - pytest
+  - pytest-cov
+  - pylint
+  - radon
+  - jupyter
+  - notebook
+  - ipykernel
+  - pip:
+      - ruff
+      - xgboost
+      - lightgbm
+      - imbalanced-learn
+      - category-encoders
+      - shap
+      - mlflow
+      - pandera

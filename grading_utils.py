@@ -1,0 +1,2103 @@
+from __future__ import annotations
+
+import ast
+import csv
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
+
+import requests
+import yaml
+
+
+RUBRIC_DIMENSIONS = [
+    "single_entry_modularization",
+    "code_quality_efficiency",
+    "documentation_clarity",
+    "testing_coverage",
+    "dependency_management",
+    "error_handling_validation",
+    "artifacting_reproducibility",
+    "pipeline_completeness",
+    "version_control_workflow",
+]
+
+DIMENSION_TO_SCORE_COLUMN = {
+    "modularization": "single_entry_modularization",
+    "code_quality": "code_quality_efficiency",
+    "documentation": "documentation_clarity",
+    "testing": "testing_coverage",
+    "dependencies": "dependency_management",
+    "error_handling": "error_handling_validation",
+    "artifacting": "artifacting_reproducibility",
+    "pipeline": "pipeline_completeness",
+    "version_control": "version_control_workflow",
+}
+
+EVIDENCE_FIELDS_BY_DIMENSION = {
+    "modularization": [
+        "main_entry_signal",
+        "core_module_count",
+        "orchestrated_module_count",
+        "stub_penalty_flag",
+    ],
+    "code_quality": [
+        "ruff_issue_count",
+        "pylint_score",
+        "radon_average_cc",
+    ],
+    "documentation": [
+        "readme_present",
+        "readme_run_instructions_present",
+        "function_docstring_ratio",
+    ],
+    "testing": [
+        "pytest_passed",
+        "pytest_pass_count",
+        "pytest_fail_count",
+        "pytest_error_count",
+        "pytest_total_count",
+        "pytest_pass_rate",
+        "coverage_pct",
+        "pytest_import_error",
+        "pytest_timeout",
+    ],
+    "dependencies": [
+        "environment_yml_present",
+        "conda_yml_present",
+    ],
+    "error_handling": [
+        "validation_function_present",
+        "validation_raise_present",
+        "validation_none_or_type_guard",
+        "validation_empty_guard",
+        "validation_required_columns_guard",
+        "validation_missing_values_guard",
+        "validation_target_guard",
+        "validation_dtype_guard",
+        "validation_range_or_domain_guard",
+    ],
+    "artifacting": [
+        "processed_data_artifact_present",
+        "model_artifact_present",
+        "prediction_artifact_present",
+        "structured_asset_paths_present",
+    ],
+    "pipeline": [
+        "all_notebooks_found",
+        "target_notebooks_found",
+        "valid_target_notebooks",
+        "valid_target_notebooks_with_src_import",
+        "target_notebook_names",
+        "target_notebooks_with_src_import_names",
+        "notebook_target_rule",
+    ],
+    "version_control": [
+        "git_unique_contributors",
+        "github_prs_found",
+        "github_unique_pr_authors",
+        "github_unique_reviewers",
+        "github_api_authenticated",
+    ],
+}
+
+EVIDENCE_METADATA_FIELDS = [
+    "repo_id",
+    "repo_url",
+    "branch",
+    "cutoff_commit",
+    "dimensions_run",
+    "is_benchmark",
+    "error",
+    "traceback",
+]
+
+CORE_MODULE_MAP = {
+    "load": ["load", "loader", "ingest", "read_data"],
+    "clean": ["clean", "cleaner"],
+    "validate": ["validate", "validation", "schema"],
+    "preprocess": ["preprocess", "preprocessing", "transform", "encode", "scale"],
+    "features": ["feature", "features"],
+    "train": ["train", "trainer", "fit_model"],
+    "evaluate": ["evaluate", "evaluation", "metrics"],
+    "infer": ["infer", "inference", "predict"],
+    "main": ["main"],
+}
+
+BUSINESS_KEYWORDS = {
+    "client": ["client", "industry"],
+    "business_unit": ["business unit", "department"],
+    "maturity": ["maturity", "tools", "processes", "people", "strategy"],
+    "goal": ["goal", "objective", "kpi", "baseline"],
+    "problem": ["problem", "pain point"],
+    "solution": ["solution", "functionalit"],
+    "scalability": ["scalability", "scale", "other use cases"],
+    "benefit": ["benefit", "competitiveness", "opportunit"],
+    "cost": ["cost", "talent", "infrastructure", "licenses", "time"],
+    "risk": ["risk", "challenge", "mitigation", "security"],
+}
+
+RUN_SECTION_KEYWORDS = ["install", "setup", "run", "pytest", "test", "usage"]
+NOTEBOOK_EXCLUDE_PARTS = {".ipynb_checkpoints"}
+NOTEBOOK_TARGET_TOKENS = ("exp", "experiment", "sandbox", "sanbox", "sand", "model_main", "modular")
+NOTEBOOK_EXCLUDE_NAME_TOKENS = ("legacy",)
+PYTEST_TIMEOUT_SECONDS = int(os.getenv("GRADER_PYTEST_TIMEOUT", "180"))
+
+
+def default_config_path() -> Path:
+    return Path(__file__).with_name("config.yaml")
+
+
+def load_grading_config(config_path: Path | None = None) -> dict[str, Any]:
+    path = config_path or default_config_path()
+    if not path.exists():
+        raise GraderError(f"Config file not found: {path}")
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = yaml.safe_load(handle) or {}
+    except yaml.YAMLError as exc:
+        raise GraderError(f"Invalid YAML config: {path}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise GraderError(f"Config file must contain a YAML mapping at the top level: {path}")
+
+    return payload
+
+
+def cfg_get(config: dict[str, Any], path: str, default: Any = None) -> Any:
+    current: Any = config
+    for key in path.split("."):
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+@dataclass
+class RepoSpec:
+    repo_id: str
+    repo_url: str
+    branch: str = "main"
+    fixed_commit: str | None = None
+    is_benchmark: bool = False
+
+
+class GraderError(Exception):
+    """Raised when a critical grading step fails."""
+
+
+def _is_selected(selected_dimensions: set[str], dimension: str) -> bool:
+    return dimension in selected_dimensions
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp(value: float, low: float = 0.0, high: float = 10.0) -> float:
+    return max(low, min(high, value))
+
+
+def round2(value: Any) -> float:
+    return round(safe_float(value), 2)
+
+
+def slugify_repo_name(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", text).strip("_")
+
+
+def canonical_repo_url(repo_url: str) -> str:
+    url = repo_url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url
+
+
+def parse_repos_file(repos_file: Path) -> list[RepoSpec]:
+    specs: list[RepoSpec] = []
+    seen: set[str] = set()
+
+    with repos_file.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) == 1:
+                repo_url = parts[0]
+                repo_id = default_repo_id_from_url(repo_url, line_number)
+                branch = "main"
+                fixed_commit = None
+            elif len(parts) == 2:
+                repo_id, repo_url = parts
+                branch = "main"
+                fixed_commit = None
+            elif len(parts) == 3:
+                repo_id, repo_url, branch = parts
+                fixed_commit = None
+            else:
+                repo_id, repo_url, branch, fixed_commit = parts[:4]
+
+            repo_url = canonical_repo_url(repo_url)
+            if repo_url in seen:
+                continue
+            seen.add(repo_url)
+
+            specs.append(
+                RepoSpec(
+                    repo_id=repo_id,
+                    repo_url=repo_url,
+                    branch=branch or "main",
+                    fixed_commit=fixed_commit or None,
+                )
+            )
+
+    return specs
+
+
+def default_repo_id_from_url(repo_url: str, line_number: int) -> str:
+    owner, repo = parse_owner_repo(repo_url)
+    return f"{line_number:02d}_{owner}_{repo}"
+
+
+def parse_owner_repo(repo_url: str) -> tuple[str, str]:
+    stripped = repo_url.strip()
+    if stripped.endswith(".git"):
+        stripped = stripped[:-4]
+
+    if stripped.startswith("git@github.com:"):
+        path = stripped.split(":", 1)[1]
+        owner, repo = path.split("/", 1)
+        return owner, repo
+
+    parsed = urlparse(stripped)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        raise GraderError(f"Could not parse owner/repo from URL: {repo_url}")
+    owner, repo = parts[0], parts[1]
+    return owner, repo
+
+
+def run_command(
+    command: list[str],
+    cwd: Path | None = None,
+    timeout: int = 120,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=merged_env,
+            check=False,
+        )
+        return {
+            "ok": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "command": shlex.join(command),
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "returncode": 127,
+            "stdout": "",
+            "stderr": f"Command not found: {command[0]}",
+            "command": shlex.join(command),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": f"Timed out after {timeout}s",
+            "command": shlex.join(command),
+        }
+
+
+def ensure_clone(repo: RepoSpec, clones_dir: Path) -> Path:
+    owner, repo_name = parse_owner_repo(repo.repo_url)
+    target = clones_dir / slugify_repo_name(f"{repo.repo_id}_{owner}_{repo_name}")
+
+    if not target.exists():
+        result = run_command(["git", "clone", repo.repo_url, str(target)], timeout=240)
+        if not result["ok"]:
+            raise GraderError(f"git clone failed for {repo.repo_url}: {result['stderr']}")
+
+    fetch_result = run_command(["git", "fetch", "--all", "--tags", "--prune"], cwd=target, timeout=240)
+    if not fetch_result["ok"]:
+        raise GraderError(f"git fetch failed for {repo.repo_url}: {fetch_result['stderr']}")
+
+    return target
+
+
+def resolve_cutoff_commit(repo_dir: Path, branch: str, cutoff_local: str, timezone_name: str) -> str:
+    local_dt = datetime.strptime(cutoff_local, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo(timezone_name))
+    cutoff_text = local_dt.strftime("%Y-%m-%d %H:%M:%S %z")
+    candidates = [branch, f"origin/{branch}", f"refs/remotes/origin/{branch}"]
+
+    for ref in candidates:
+        result = run_command(["git", "rev-list", "-n", "1", f"--before={cutoff_text}", ref], cwd=repo_dir)
+        commit = result["stdout"].strip()
+        if commit:
+            return commit
+
+    raise GraderError(f"No commit found on branch {branch} before cutoff {cutoff_text}")
+
+
+def checkout_commit(repo_dir: Path, commit: str) -> None:
+    reset_result = run_command(["git", "reset", "--hard"], cwd=repo_dir)
+    if not reset_result["ok"]:
+        raise GraderError(f"git reset failed: {reset_result['stderr']}")
+
+    clean_result = run_command(["git", "clean", "-fd"], cwd=repo_dir)
+    if not clean_result["ok"]:
+        raise GraderError(f"git clean failed: {clean_result['stderr']}")
+
+    checkout_result = run_command(["git", "checkout", "--force", commit], cwd=repo_dir, timeout=120)
+    if not checkout_result["ok"]:
+        raise GraderError(f"git checkout failed for commit {commit}: {checkout_result['stderr']}")
+
+
+def git_commit_metadata(repo_dir: Path, commit: str) -> dict[str, Any]:
+    result = run_command(["git", "show", "-s", "--format=%H%n%cI%n%s", commit], cwd=repo_dir)
+    lines = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
+    return {
+        "resolved_commit": commit,
+        "commit_datetime": lines[1] if len(lines) > 1 else "",
+        "commit_subject": lines[2] if len(lines) > 2 else "",
+    }
+
+
+def list_repo_files(repo_dir: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in repo_dir.rglob("*"):
+        if ".git" in path.parts:
+            continue
+        files.append(path)
+    return files
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="latin-1", errors="ignore")
+    except OSError:
+        return ""
+
+
+def python_files(repo_dir: Path) -> list[Path]:
+    return [p for p in repo_dir.rglob("*.py") if ".git" not in p.parts]
+
+
+def is_notebook_path(path: Path) -> bool:
+    return path.suffix == ".ipynb" and not any(part in NOTEBOOK_EXCLUDE_PARTS for part in path.parts)
+
+
+def count_lines_of_code(repo_dir: Path) -> int:
+    total = 0
+    for path in python_files(repo_dir):
+        try:
+            total += sum(1 for _ in path.open("r", encoding="utf-8"))
+        except UnicodeDecodeError:
+            continue
+    return total
+
+
+def find_readme(repo_dir: Path) -> Path | None:
+    candidates = [repo_dir / "README.md", repo_dir / "readme.md", repo_dir / "README.MD"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    for path in repo_dir.glob("README*"):
+        if path.is_file():
+            return path
+    return None
+
+
+def normalized_stem(path: Path) -> str:
+    stem = path.stem.lower()
+    stem = stem.replace("data_", "").replace("_data", "")
+    stem = stem.replace("ml_", "")
+    return stem
+
+
+def scan_repo_structure(repo_dir: Path) -> dict[str, Any]:
+    src_dir = repo_dir / "src"
+    tests_dir = repo_dir / "tests"
+    notebooks = [p for p in repo_dir.rglob("*.ipynb") if is_notebook_path(p)]
+    py_files = python_files(repo_dir)
+    return {
+        "src_dir_present": int(src_dir.exists()),
+        "tests_dir_present": int(tests_dir.exists()),
+        "repo_notebook_count": len(notebooks),
+        "python_module_count": len(py_files),
+        "lines_of_code": count_lines_of_code(repo_dir),
+    }
+
+
+def scan_readme(repo_dir: Path) -> dict[str, Any]:
+    readme_path = find_readme(repo_dir)
+    if not readme_path:
+        return {
+            "readme_present": 0,
+            "readme_word_count": 0,
+            "readme_run_keywords_found": 0,
+            "readme_run_instructions_present": 0,
+            "business_sections_found": 0,
+            "business_section_ratio": 0.0,
+            "readme_has_badges": 0,
+            "readme_path": "",
+        }
+
+    text = read_text(readme_path)
+    text_lower = text.lower()
+    business_hits = sum(any(keyword in text_lower for keyword in keywords) for keywords in BUSINESS_KEYWORDS.values())
+    run_hits = sum(keyword in text_lower for keyword in RUN_SECTION_KEYWORDS)
+
+    return {
+        "readme_present": 1,
+        "readme_word_count": len(re.findall(r"\b\w+\b", text)),
+        "readme_run_keywords_found": run_hits,
+        "readme_run_instructions_present": int(run_hits >= 2),
+        "business_sections_found": business_hits,
+        "business_section_ratio": round(business_hits / max(len(BUSINESS_KEYWORDS), 1), 3),
+        "readme_has_badges": int("img.shields.io" in text_lower or "badge" in text_lower),
+        "readme_path": str(readme_path.relative_to(repo_dir)),
+    }
+
+def _is_target_experiment_notebook(path: Path) -> bool:
+    stem = path.stem.lower()
+    has_target = any(token in stem for token in NOTEBOOK_TARGET_TOKENS)
+    has_excluded_name = any(token in stem for token in NOTEBOOK_EXCLUDE_NAME_TOKENS)
+    return has_target and not has_excluded_name
+
+def _notebook_imports_from_src(payload: dict[str, Any]) -> bool:
+    for cell in payload.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+
+        source = "".join(cell.get("source", []))
+
+        if re.search(r"^\s*from\s+src(?:\.[A-Za-z_][A-Za-z0-9_]*)+\s+import\s+", source, flags=re.MULTILINE):
+            return True
+
+        if re.search(r"^\s*import\s+src(?:\.[A-Za-z_][A-Za-z0-9_]*)*", source, flags=re.MULTILINE):
+            return True
+
+    return False
+
+def scan_notebooks(repo_dir: Path) -> dict[str, Any]:
+    all_notebooks = [path for path in repo_dir.rglob("*.ipynb") if is_notebook_path(path)]
+    target_notebooks = [
+        path for path in all_notebooks if _is_target_experiment_notebook(path)
+    ]
+
+    valid_count = 0
+    valid_target_notebooks_with_src_import = 0
+    code_cells = 0
+    markdown_cells = 0
+    selected_names: list[str] = []
+    target_notebooks_with_src_import_names: list[str] = []
+
+    for notebook in target_notebooks:
+        try:
+            payload = json.loads(read_text(notebook))
+            valid_count += 1
+            if _notebook_imports_from_src(payload):
+                valid_target_notebooks_with_src_import += 1
+                target_notebooks_with_src_import_names.append(str(notebook.relative_to(repo_dir)))
+            selected_names.append(str(notebook.relative_to(repo_dir)))
+            for cell in payload.get("cells", []):
+                if cell.get("cell_type") == "code":
+                    code_cells += 1
+                elif cell.get("cell_type") == "markdown":
+                    markdown_cells += 1
+        except json.JSONDecodeError:
+            continue
+
+    return {
+        "all_notebooks_found": len(all_notebooks),
+        "target_notebooks_found": len(target_notebooks),
+        "valid_target_notebooks": valid_count,
+        "notebook_code_cells": code_cells,
+        "notebook_markdown_cells": markdown_cells,
+        "notebook_present": int(len(target_notebooks) > 0),
+        "notebook_valid": int(valid_count > 0),
+        "target_notebook_names": " | ".join(selected_names),
+        "notebook_target_rule": "name contains exp, experiment, sandbox, sanbox, sand, model_main, or modular, excluding legacy, and notebook imports from src",
+        "valid_target_notebooks_with_src_import": valid_target_notebooks_with_src_import,
+        "target_notebooks_with_src_import_names": " | ".join(target_notebooks_with_src_import_names),
+    }
+
+def _validation_candidate_paths(repo_dir: Path) -> list[Path]:
+    return [
+        path for path in python_files(repo_dir)
+        if any(token in path.stem.lower() for token in ["valid", "schema"])
+    ]
+
+def _clean_python_for_detection(text: str) -> str:
+    text = re.sub(r'"""[\s\S]*?"""', " ", text)
+    text = re.sub(r"'''[\s\S]*?'''", " ", text)
+    text = re.sub(r"#.*", " ", text)
+    return text.lower()
+
+def scan_validation_breadth(repo_dir: Path) -> dict[str, Any]:
+    validation_paths = _validation_candidate_paths(repo_dir)
+
+    signals = {
+        "validation_function_present": 0,
+        "validation_raise_present": 0,
+        "validation_none_or_type_guard": 0,
+        "validation_empty_guard": 0,
+        "validation_required_columns_guard": 0,
+        "validation_missing_values_guard": 0,
+        "validation_target_guard": 0,
+        "validation_dtype_guard": 0,
+        "validation_range_or_domain_guard": 0,
+    }
+
+    for path in validation_paths:
+        raw_text = read_text(path)
+        code = _clean_python_for_detection(raw_text)
+
+        if re.search(r"\bdef\s+\w*valid\w*\s*\(", code):
+            signals["validation_function_present"] = 1
+
+        if re.search(r"\braise\s+(valueerror|typeerror|exception|runtimeerror|assertionerror)\b", code):
+            signals["validation_raise_present"] = 1
+
+        if (
+            re.search(r"\bdf\s+is\s+none\b", code)
+            or re.search(r"not\s+isinstance\s*\(\s*df\s*,\s*(pd\.)?dataframe\s*\)", code)
+        ):
+            signals["validation_none_or_type_guard"] = 1
+
+        if (
+            ".empty" in code
+            or re.search(r"len\s*\(\s*df\s*\)\s*==\s*0", code)
+        ):
+            signals["validation_empty_guard"] = 1
+
+        if (
+            any(token in code for token in ["required_columns", "required_cols"])
+            and (
+                re.search(r"not\s+in\s+df\.columns", code)
+                or re.search(r"\bmissing\s*=\s*\[", code)
+                or re.search(r"set\s*\(\s*required_columns\s*\)", code)
+                or re.search(r"set\s*\(\s*required_cols\s*\)", code)
+            )
+        ):
+            signals["validation_required_columns_guard"] = 1
+
+        if (
+            re.search(r"\.isna\s*\(\)\.any\s*\(\)", code)
+            or re.search(r"\.isnull\s*\(\)\.any\s*\(\)", code)
+            or re.search(r"\.notna\s*\(\)\.any\s*\(\)", code)
+            or re.search(r"\.notnull\s*\(\)\.any\s*\(\)", code)
+        ):
+            signals["validation_missing_values_guard"] = 1
+
+        if (
+            re.search(r"\btarget_column\b", code)
+            and (
+                re.search(r"target_column\s+not\s+in\s+df\.columns", code)
+                or re.search(r"df\s*\[\s*target_column\s*\]", code)
+                or re.search(r"\btarget_allowed_values\b", code)
+                or re.search(r"\ballowed_values\b", code)
+            )
+        ):
+            signals["validation_target_guard"] = 1
+
+        if (
+            re.search(r"\bis_numeric_dtype\s*\(", code)
+            or re.search(r"\bis_string_dtype\s*\(", code)
+            or re.search(r"\bis_bool_dtype\s*\(", code)
+            or re.search(r"\bis_datetime64_any_dtype\s*\(", code)
+            or re.search(r"\.dtype\b", code)
+            or re.search(r"\.dtypes\b", code)
+            or re.search(r"\bselect_dtypes\s*\(", code)
+        ):
+            signals["validation_dtype_guard"] = 1
+
+        if (
+            re.search(r"\(df\s*\[[^\]]+\]\s*<\s*-?\d+(\.\d+)?\)\.any\s*\(\)", code)
+            or re.search(r"\(df\s*\[[^\]]+\]\s*>\s*-?\d+(\.\d+)?\)\.any\s*\(\)", code)
+            or re.search(r"\(df\s*\[[^\]]+\]\s*<=\s*-?\d+(\.\d+)?\)\.any\s*\(\)", code)
+            or re.search(r"\(df\s*\[[^\]]+\]\s*>=\s*-?\d+(\.\d+)?\)\.any\s*\(\)", code)
+            or re.search(r"\.between\s*\(", code)
+            or re.search(r"\.isin\s*\(", code)
+            or re.search(r"\bnumeric_non_negative_cols\b", code)
+        ):
+            signals["validation_range_or_domain_guard"] = 1
+
+    return signals
+
+def scan_python_files(repo_dir: Path) -> dict[str, Any]:
+    module_count = 0
+    parseable_count = 0
+    module_docstring_count = 0
+    function_count = 0
+    function_docstring_count = 0
+    class_count = 0
+    comment_count = 0
+
+    for path in python_files(repo_dir):
+        text = read_text(path)
+
+        comment_count += len(re.findall(r"^\s*#", text, flags=re.MULTILINE))
+
+        module_count += 1
+        try:
+            tree = ast.parse(text)
+            parseable_count += 1
+        except SyntaxError:
+            continue
+
+        if ast.get_docstring(tree):
+            module_docstring_count += 1
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                function_count += 1
+                if ast.get_docstring(node):
+                    function_docstring_count += 1
+
+    loc = count_lines_of_code(repo_dir)
+    comment_ratio = comment_count / max(loc, 1)
+    validation_signals = scan_validation_breadth(repo_dir)
+
+    return {
+        "python_module_count": module_count,
+        "python_parseable_count": parseable_count,
+        "module_docstring_ratio": round(module_docstring_count / max(module_count, 1), 3),
+        "function_count": function_count,
+        "function_docstring_ratio": round(function_docstring_count / max(function_count, 1), 3),
+        "comment_count": comment_count,
+        "comment_density_per_100_loc": round((comment_count / max(loc, 1)) * 100, 2),
+        "comment_ratio": round(comment_ratio, 4),
+        "class_count": class_count,
+        **validation_signals,
+    }
+
+
+def _is_main_guard_test(node: ast.AST) -> bool:
+    """
+    Detect: if __name__ == "__main__":
+    """
+    if not isinstance(node, ast.Compare):
+        return False
+    if not isinstance(node.left, ast.Name) or node.left.id != "__name__":
+        return False
+    if len(node.ops) != 1 or not isinstance(node.ops[0], ast.Eq):
+        return False
+    if len(node.comparators) != 1:
+        return False
+
+    comparator = node.comparators[0]
+    if isinstance(comparator, ast.Constant):
+        return comparator.value == "__main__"
+    if isinstance(comparator, ast.Str):
+        return comparator.s == "__main__"
+    return False
+
+
+def _called_function_names_in_nodes(nodes: list[ast.stmt]) -> set[str]:
+    """
+    Return simple function names called inside a list of AST nodes.
+    Example:
+    - main()
+    - run_pipeline()
+    """
+    called: set[str] = set()
+    for node in nodes:
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                func = child.func
+                if isinstance(func, ast.Name):
+                    called.add(func.id)
+    return called
+
+
+def scan_main_entry(repo_dir: Path) -> dict[str, Any]:
+    """
+    A valid entry point for this rubric means:
+    - a runner file exists
+    - it has a main guard
+    - the main guard calls at least one top-level function defined in the same file
+
+    This avoids false negatives when the function is named run_pipeline(),
+    run(), execute_pipeline(), etc. instead of main()
+    """
+    candidates = [
+        repo_dir / "main.py",
+        repo_dir / "src" / "main.py",
+        repo_dir / "run_pipeline.py",
+        repo_dir / "src" / "run_pipeline.py",
+        repo_dir / "run.py",
+        repo_dir / "src" / "run.py",
+        repo_dir / "pipeline.py",
+        repo_dir / "src" / "pipeline.py",
+    ]
+    entry_path = next((path for path in candidates if path.exists()), None)
+
+    if not entry_path:
+        return {
+            "main_py_present": 0,
+            "main_guard_present": 0,
+            "main_function_present": 0,
+            "main_import_count": 0,
+            "main_path": "",
+        }
+
+    text = read_text(entry_path)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {
+            "main_py_present": 1,
+            "main_guard_present": 0,
+            "main_function_present": 0,
+            "main_import_count": 0,
+            "main_path": str(entry_path.relative_to(repo_dir)),
+        }
+
+    top_level_function_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    main_guard_present = 0
+    main_guard_calls_local_function = 0
+
+    for node in tree.body:
+        if isinstance(node, ast.If) and _is_main_guard_test(node.test):
+            main_guard_present = 1
+            called_names = _called_function_names_in_nodes(node.body)
+            if any(name in top_level_function_names for name in called_names):
+                main_guard_calls_local_function = 1
+            break
+
+    import_count = len(
+        [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    )
+
+    return {
+        "main_py_present": 1,
+        "main_guard_present": main_guard_present,
+        "main_function_present": main_guard_calls_local_function,
+        "main_import_count": import_count,
+        "main_path": str(entry_path.relative_to(repo_dir)),
+    }
+
+
+def scan_pipeline_modules(repo_dir: Path) -> dict[str, Any]:
+    files = [normalized_stem(path) for path in python_files(repo_dir)]
+    matched: dict[str, int] = {}
+
+    for module_name, patterns in CORE_MODULE_MAP.items():
+        matched[module_name] = int(any(any(pattern in stem for pattern in patterns) for stem in files))
+
+    return {
+        **{f"module_{name}": value for name, value in matched.items()},
+        "core_module_count": sum(matched.values()),
+    }
+
+
+def _find_main_path(repo_dir: Path) -> Path | None:
+    candidates = [repo_dir / "main.py", repo_dir / "src" / "main.py"]
+    return next((path for path in candidates if path.exists()), None)
+
+def scan_artifact_contract(repo_dir: Path) -> dict[str, Any]:
+    main_path = _find_main_path(repo_dir)
+    if not main_path or not main_path.exists():
+        return {
+            "processed_data_artifact_present": 0,
+            "model_artifact_present": 0,
+            "prediction_artifact_present": 0,
+            "structured_asset_paths_present": 0,
+        }
+
+    code = _clean_python_for_detection(read_text(main_path))
+
+    csv_save_calls = re.findall(
+        r"save_csv\([^\n]*\)|\b\w+\.to_csv\([^\n]*\)",
+        code,
+    )
+
+    processed_path_present = bool(
+        re.search(r"\b\w*(?:clean|processed)\w*_path\b", code)
+        or re.search(r'\["\w*(?:clean|processed)\w*"\]', code)
+        or re.search(r"\['\w*(?:clean|processed)\w*'\]", code)
+        or "data/processed" in code
+        or "clean.csv" in code
+        or "processed.csv" in code
+    )
+
+    model_path_present = bool(
+        re.search(r"\b\w*model\w*_path\b", code)
+        or re.search(r'\["\w*model\w*"\]', code)
+        or re.search(r"\['\w*model\w*'\]", code)
+        or "models" in code
+        or ".joblib" in code
+        or ".pkl" in code
+        or ".pickle" in code
+    )
+
+    prediction_path_present = bool(
+        re.search(r"\b\w*(?:pred|prediction|report|artifact)\w*_path\b", code)
+        or re.search(r'\["\w*(?:pred|prediction|report|artifact)\w*"\]', code)
+        or re.search(r"\['\w*(?:pred|prediction|report|artifact)\w*'\]", code)
+        or "reports" in code
+        or "artifacts" in code
+        or "predictions.csv" in code
+        or "prediction.csv" in code
+    )
+
+    processed_data_artifact_present = int(
+        bool(csv_save_calls) and processed_path_present
+    )
+
+    model_save_present = bool(
+        re.search(r"\b(?:joblib\.dump|pickle\.dump|save_model)\s*\(", code)
+        or ("train_model(" in code and "model_path" in code)
+    )
+
+    model_artifact_present = int(
+        model_save_present and model_path_present
+    )
+
+    inference_call_present = bool(
+        re.search(r"\b\w*infer\w*\s*\(", code)
+    )
+
+    explicit_prediction_save = any(
+        re.search(r"(?:pred|prediction|report|artifact)", call)
+        for call in csv_save_calls
+    )
+
+    inference_saves_directly = bool(
+        re.search(r"\b\w*infer\w*\s*\([^\)]*(?:save_path|output_path)\s*=", code, re.S)
+    )
+
+    prediction_artifact_present = int(
+        inference_call_present
+        and (
+            explicit_prediction_save
+            or inference_saves_directly
+        )
+    )
+
+    structured_asset_paths_present = int(
+        sum([
+            processed_path_present,
+            model_path_present,
+            prediction_path_present,
+        ]) >= 2
+    )
+
+    return {
+        "processed_data_artifact_present": processed_data_artifact_present,
+        "model_artifact_present": model_artifact_present,
+        "prediction_artifact_present": prediction_artifact_present,
+        "structured_asset_paths_present": structured_asset_paths_present,
+    }
+
+def _extract_import_targets(tree: ast.AST) -> list[str]:
+    targets: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                module_name = alias.name.lower()
+                if module_name.startswith("src."):
+                    targets.append(module_name)
+                    if alias.asname:
+                        targets.append(alias.asname.lower())
+        elif isinstance(node, ast.ImportFrom):
+            module_name = (node.module or "").lower()
+            if module_name.startswith("src"):
+                targets.append(module_name)
+                for alias in node.names:
+                    if alias.name:
+                        targets.append(alias.name.lower())
+                    if alias.asname:
+                        targets.append(alias.asname.lower())
+
+    return targets
+
+
+def _extract_called_names(tree: ast.AST) -> list[str]:
+    called: list[str] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called.append(func.id.lower())
+            elif isinstance(func, ast.Attribute):
+                called.append(func.attr.lower())
+
+    return called
+
+
+def scan_main_orchestration(repo_dir: Path) -> dict[str, Any]:
+    main_path = _find_main_path(repo_dir)
+    if not main_path:
+        return {
+            "main_core_import_hits": 0,
+            "main_core_call_hits": 0,
+            "main_orchestration_signal": 0,
+            "main_imported_core_modules": "",
+            "main_called_pipeline_terms": "",
+        }
+
+    text = read_text(main_path)
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {
+            "main_core_import_hits": 0,
+            "main_core_call_hits": 0,
+            "main_orchestration_signal": 0,
+            "main_imported_core_modules": "",
+            "main_called_pipeline_terms": "",
+        }
+
+    import_targets = _extract_import_targets(tree)
+    called_names = _extract_called_names(tree)
+
+    core_hits: list[str] = []
+    for module_name, patterns in CORE_MODULE_MAP.items():
+        if module_name == "main":
+            continue
+        if any(any(pattern in target for pattern in patterns) for target in import_targets):
+            core_hits.append(module_name)
+
+    pipeline_terms = [
+        "load",
+        "read",
+        "ingest",
+        "clean",
+        "validate",
+        "preprocess",
+        "transform",
+        "feature",
+        "train",
+        "fit",
+        "evaluate",
+        "predict",
+        "infer",
+        "save",
+        "dump",
+    ]
+
+    call_hits = sorted({term for term in pipeline_terms if any(term in call for call in called_names)})
+
+    return {
+        "main_core_import_hits": len(core_hits),
+        "main_core_call_hits": len(call_hits),
+        "main_orchestration_signal": int(len(core_hits) >= 2 and len(call_hits) >= 2),
+        "main_imported_core_modules": " | ".join(sorted(core_hits)),
+        "main_called_pipeline_terms": " | ".join(call_hits),
+    }
+
+
+def scan_module_stubness(repo_dir: Path) -> dict[str, Any]:
+    stub_candidates = 0
+    tiny_module_count = 0
+    real_module_count = 0
+
+    excluded_names = {"__init__", "main", "setup", "conftest"}
+
+    for path in python_files(repo_dir):
+        stem = path.stem.lower()
+        if stem in excluded_names:
+            continue
+
+        text = read_text(path)
+        if not text.strip():
+            continue
+
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+
+        function_defs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        class_defs = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+        executable_defs = len(function_defs) + len(class_defs)
+
+        line_count = len([line for line in text.splitlines() if line.strip() and not line.strip().startswith("#")])
+
+        if executable_defs > 0:
+            stub_candidates += 1
+
+            only_pass = True
+            for fn in function_defs:
+                fn_body = [
+                    n for n in fn.body
+                    if not (
+                        isinstance(n, ast.Expr)
+                        and isinstance(getattr(n, "value", None), ast.Constant)
+                        and isinstance(n.value.value, str)
+                    )
+                ]
+                if not fn_body:
+                    continue
+                if not all(isinstance(n, (ast.Pass, ast.Expr)) for n in fn_body):
+                    only_pass = False
+                    break
+
+            if line_count <= 12 or only_pass:
+                tiny_module_count += 1
+            else:
+                real_module_count += 1
+
+    stub_ratio = round(tiny_module_count / max(stub_candidates, 1), 3) if stub_candidates else 0.0
+
+    return {
+        "stub_candidate_module_count": stub_candidates,
+        "tiny_stub_module_count": tiny_module_count,
+        "real_module_count": real_module_count,
+        "tiny_stub_ratio": stub_ratio,
+    }
+
+
+
+
+
+def derive_modularization_evidence(
+    evidence: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    stub_threshold = safe_float(cfg_get(config, "scoring.modularization.stub_penalty_threshold", 0.5))
+
+    main_entry_signal = int(
+        evidence.get("main_py_present", 0)
+        and evidence.get("main_guard_present", 0)
+        and evidence.get("main_function_present", 0)
+    )
+
+    orchestrated_module_count = int(evidence.get("main_core_import_hits", 0) or 0)
+    imported_modules = set(filter(None, (evidence.get("main_imported_core_modules", "") or "").split(" | ")))
+
+    # Validation is a required pipeline stage for this course.
+    # If main.py does not import a validate stage, the pipeline is not fully orchestrated.
+    if "validate" not in imported_modules and orchestrated_module_count > 0:
+        orchestrated_module_count -= 1
+
+    stub_penalty_flag = int(
+        float(evidence.get("tiny_stub_ratio", 0.0) or 0.0) >= stub_threshold
+    )
+
+    return {
+        "main_entry_signal": main_entry_signal,
+        "core_module_count": int(evidence.get("core_module_count", 0) or 0),
+        "orchestrated_module_count": orchestrated_module_count,
+        "stub_penalty_flag": stub_penalty_flag,
+    }
+
+
+def slim_evidence_for_selected_dimensions(
+    evidence: dict[str, Any],
+    selected_dimensions: set[str],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    derived = dict(evidence)
+    if "modularization" in selected_dimensions:
+        derived.update(derive_modularization_evidence(derived, config))
+
+    keep = set(EVIDENCE_METADATA_FIELDS)
+    for dimension in selected_dimensions:
+        keep.update(EVIDENCE_FIELDS_BY_DIMENSION.get(dimension, []))
+
+    return {key: derived[key] for key in derived if key in keep}
+
+
+def scan_dependency_files(repo_dir: Path) -> dict[str, Any]:
+    env_candidates = [repo_dir / "environment.yml", repo_dir / "environment.yaml"]
+    conda_candidates = [repo_dir / "conda.yml", repo_dir / "conda.yaml"]
+    requirements_candidates = [repo_dir / "requirements.txt", repo_dir / "pyproject.toml", repo_dir / "Pipfile"]
+    config_candidates = [repo_dir / "config.yaml", repo_dir / "config.yml", repo_dir / ".env"]
+
+    env_path = next((path for path in env_candidates if path.exists()), None)
+    conda_path = next((path for path in conda_candidates if path.exists()), None)
+    req_path = next((path for path in requirements_candidates if path.exists()), None)
+    config_path = next((path for path in config_candidates if path.exists()), None)
+
+    dependency_versions = 0
+    if env_path:
+        text = read_text(env_path)
+        dependency_versions = int(bool(re.search(r"[<>=]=?", text)))
+    elif conda_path:
+        text = read_text(conda_path)
+        dependency_versions = int(bool(re.search(r"[<>=]=?", text)))
+    elif req_path:
+        text = read_text(req_path)
+        dependency_versions = int(bool(re.search(r"==|>=|<=|~=", text)))
+
+    return {
+        "environment_yml_present": int(env_path is not None),
+        "conda_yml_present": int(conda_path is not None),
+        "requirements_txt_present": int(req_path is not None),
+        "config_file_present": int(config_path is not None),
+        "dependency_versions_declared": dependency_versions,
+        "environment_file": str(env_path.relative_to(repo_dir)) if env_path else "",
+        "conda_file": str(conda_path.relative_to(repo_dir)) if conda_path else "",
+        "requirements_file": str(req_path.relative_to(repo_dir)) if req_path else "",
+        "config_file": str(config_path.relative_to(repo_dir)) if config_path else "",
+    }
+
+
+
+def tool_available(tool_name: str) -> bool:
+    return shutil.which(tool_name) is not None
+
+
+def run_ruff(repo_dir: Path) -> dict[str, Any]:
+    if not tool_available("ruff"):
+        return {"ruff_available": 0, "ruff_issue_count": None, "ruff_returncode": None}
+
+    result = run_command(["ruff", "check", ".", "--output-format", "json"], cwd=repo_dir, timeout=240)
+    issue_count = None
+
+    if result["stdout"].strip():
+        try:
+            payload = json.loads(result["stdout"])
+            issue_count = len(payload)
+        except json.JSONDecodeError:
+            issue_count = None
+    elif result["ok"]:
+        issue_count = 0
+
+    return {
+        "ruff_available": 1,
+        "ruff_issue_count": issue_count,
+        "ruff_returncode": result["returncode"],
+    }
+
+
+PYLINT_SCORE_RE = re.compile(r"rated at\s+([-0-9.]+)/10")
+
+
+def run_pylint(repo_dir: Path) -> dict[str, Any]:
+    if not tool_available("pylint"):
+        return {"pylint_available": 0, "pylint_score": None, "pylint_returncode": None}
+
+    target = "src" if (repo_dir / "src").exists() else "."
+    cmd = ["pylint", target, "--rcfile", "/home/idiazl/2026_MLOps/Grades/.pylintrc"]
+    result = run_command(cmd, cwd=repo_dir, timeout=300)
+    match = PYLINT_SCORE_RE.search(result["stdout"] + "\n" + result["stderr"])
+    score = float(match.group(1)) if match else None
+
+    return {
+        "pylint_available": 1,
+        "pylint_score": score,
+        "pylint_returncode": result["returncode"],
+    }
+
+
+def run_radon(repo_dir: Path) -> dict[str, Any]:
+    if not tool_available("radon"):
+        return {"radon_available": 0, "radon_average_cc": None, "radon_files_analyzed": None}
+
+    target = "src" if (repo_dir / "src").exists() else "."
+    result = run_command(["radon", "cc", target, "-j", "-s"], cwd=repo_dir, timeout=240)
+
+    if not result["stdout"].strip():
+        return {"radon_available": 1, "radon_average_cc": None, "radon_files_analyzed": 0}
+
+    try:
+        payload = json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        return {"radon_available": 1, "radon_average_cc": None, "radon_files_analyzed": None}
+
+    complexities: list[float] = []
+    for records in payload.values():
+        for item in records:
+            complexities.append(float(item.get("complexity", 0)))
+
+    average = sum(complexities) / len(complexities) if complexities else 0.0
+    return {
+        "radon_available": 1,
+        "radon_average_cc": round(average, 3),
+        "radon_files_analyzed": len(payload),
+    }
+
+
+def run_pytest(repo_dir: Path) -> dict[str, Any]:
+    tests_dir = repo_dir / "tests"
+    test_files = [p for p in tests_dir.rglob("test_*.py")] if tests_dir.exists() else []
+
+    def empty_payload(pytest_available: int, pytest_ran: int) -> dict[str, Any]:
+        return {
+            "pytest_available": pytest_available,
+            "pytest_ran": pytest_ran,
+            "pytest_passed": 0,
+            "pytest_pass_count": 0,
+            "pytest_fail_count": 0,
+            "pytest_error_count": 0,
+            "pytest_total_count": 0,
+            "pytest_pass_rate": None,
+            "coverage_pct": None,
+            "tests_collected": 0,
+            "pytest_returncode": None,
+            "pytest_timeout": 0,
+            "pytest_import_error": 0,
+            "pytest_collection_error": 0,
+            "pytest_environment_warning": 0,
+            "pytest_stdout_tail": "",
+            "pytest_stderr_tail": "",
+            "pytest_command": "",
+        }
+
+    if not test_files:
+        return empty_payload(int(tool_available("pytest")), 0)
+
+    if not tool_available("pytest"):
+        payload = empty_payload(0, 0)
+        payload["tests_collected"] = None
+        return payload
+
+    with tempfile.TemporaryDirectory(prefix="grader_pytest_") as tmp_root:
+        tmp_root_path = Path(tmp_root)
+        temp_home = tmp_root_path / "home"
+        temp_cache = tmp_root_path / "cache"
+        temp_pycache = tmp_root_path / "pycache"
+        temp_basetemp = tmp_root_path / "pytest_tmp"
+        coverage_json = tmp_root_path / "coverage.json"
+        junit_xml = tmp_root_path / "pytest_junit.xml"
+        coverage_file = tmp_root_path / ".coverage"
+
+        temp_home.mkdir(parents=True, exist_ok=True)
+        temp_cache.mkdir(parents=True, exist_ok=True)
+        temp_pycache.mkdir(parents=True, exist_ok=True)
+        temp_basetemp.mkdir(parents=True, exist_ok=True)
+
+        cov_target = "src" if (repo_dir / "src").exists() else "."
+
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "--disable-warnings",
+            "--basetemp",
+            str(temp_basetemp),
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "pytest_cov",
+            f"--cov={cov_target}",
+            f"--cov-report=json:{coverage_json}",
+            f"--junitxml={junit_xml}",
+        ]
+
+        env = {
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONPYCACHEPREFIX": str(temp_pycache),
+            "HOME": str(temp_home),
+            "XDG_CACHE_HOME": str(temp_cache),
+            "MPLCONFIGDIR": str(temp_cache),
+            "COVERAGE_FILE": str(coverage_file),
+        }
+
+        result = run_command(command, cwd=repo_dir, timeout=PYTEST_TIMEOUT_SECONDS, env=env)
+        combined = (result["stdout"] or "") + "\n" + (result["stderr"] or "")
+        tests_collected = None
+        pass_count = 0
+        fail_count = 0
+        error_count = 0
+        skipped_count = 0
+
+        if junit_xml.exists():
+            try:
+                root = ET.fromstring(read_text(junit_xml))
+                suites = [root] if root.tag == "testsuite" else root.findall(".//testsuite")
+
+                tests_collected = sum(int(float(s.attrib.get("tests", 0))) for s in suites)
+                fail_count = sum(int(float(s.attrib.get("failures", 0))) for s in suites)
+                error_count = sum(int(float(s.attrib.get("errors", 0))) for s in suites)
+                skipped_count = sum(int(float(s.attrib.get("skipped", 0))) for s in suites)
+
+                pass_count = max(tests_collected - fail_count - error_count - skipped_count, 0)
+            except Exception:
+                tests_collected = None
+                pass_count = 0
+                fail_count = 0
+                error_count = 0
+                skipped_count = 0
+
+        if tests_collected is None:
+            collected_match = re.search(r"collected\s+(\d+)\s+items?", combined)
+            tests_collected = int(collected_match.group(1)) if collected_match else None
+
+            summary_matches = re.findall(
+                r"(\d+)\s+(passed|failed|error|errors|skipped|xfailed|xpassed)",
+                combined,
+            )
+
+            summary_counts = {}
+            for count, label in summary_matches:
+                summary_counts[label] = summary_counts.get(label, 0) + int(count)
+
+            pass_count = summary_counts.get("passed", 0)
+            fail_count = summary_counts.get("failed", 0)
+            error_count = summary_counts.get("error", 0) + summary_counts.get("errors", 0)
+            skipped_count = summary_counts.get("skipped", 0)
+
+        total_count = pass_count + fail_count + error_count
+        pass_rate = round(pass_count / total_count, 6) if total_count > 0 else None
+
+        if tests_collected is None and (total_count + skipped_count) > 0:
+            tests_collected = total_count + skipped_count
+
+        coverage_pct = None
+        if coverage_json.exists():
+            try:
+                payload = json.loads(read_text(coverage_json))
+                totals = payload.get("totals", {})
+                coverage_pct = safe_float(totals.get("percent_covered"), None)
+            except json.JSONDecodeError:
+                coverage_pct = None
+
+        import_error = int(bool(re.search(r"(ModuleNotFoundError|ImportError):", combined)))
+        collection_error = int(bool(re.search(r"ERROR\s+collecting|collected\s+0\s+items\s*/\s*\d+\s+errors", combined)))
+        timeout_flag = int(result["returncode"] == 124)
+        environment_warning = int(import_error or timeout_flag)
+
+        return {
+            "pytest_available": 1,
+            "pytest_ran": 1,
+            "pytest_passed": int(result["returncode"] == 0),
+            "pytest_pass_count": pass_count,
+            "pytest_fail_count": fail_count,
+            "pytest_error_count": error_count,
+            "pytest_total_count": total_count,
+            "pytest_pass_rate": pass_rate,
+            "coverage_pct": coverage_pct,
+            "tests_collected": tests_collected,
+            "pytest_returncode": result["returncode"],
+            "pytest_timeout": timeout_flag,
+            "pytest_import_error": import_error,
+            "pytest_collection_error": collection_error,
+            "pytest_environment_warning": environment_warning,
+            "pytest_stdout_tail": "\n".join((result["stdout"] or "").splitlines()[-10:]),
+            "pytest_stderr_tail": "\n".join((result["stderr"] or "").splitlines()[-10:]),
+            "pytest_command": shlex.join(command),
+        }
+
+
+EDGE_CASE_PATTERNS = ["empty", "missing", "invalid", "nan", "null", "error", "raise", "edge", "shape", "type"]
+
+
+def analyze_tests(repo_dir: Path) -> dict[str, Any]:
+    tests_dir = repo_dir / "tests"
+    test_files = [p for p in tests_dir.rglob("test_*.py")] if tests_dir.exists() else []
+    edge_case_hits = 0
+    total_asserts = 0
+
+    for path in test_files:
+        text = read_text(path).lower()
+        total_asserts += len(re.findall(r"\bassert\b", text))
+        edge_case_hits += sum(pattern in text for pattern in EDGE_CASE_PATTERNS)
+
+    return {
+        "test_file_count": len(test_files),
+        "test_assert_count": total_asserts,
+        "edge_case_keyword_hits": edge_case_hits,
+    }
+
+
+def scan_git_history(repo_dir: Path) -> dict[str, Any]:
+    result = run_command(["git", "log", "--pretty=format:%an|%ae"], cwd=repo_dir, timeout=180)
+    authors = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
+    counter = Counter(authors)
+    total = sum(counter.values())
+    top_share = (counter.most_common(1)[0][1] / total) if total else 0.0
+    evenness = 1.0 - top_share if total else 0.0
+
+    return {
+        "git_commit_count_before_cutoff": total,
+        "git_unique_contributors": len(counter),
+        "git_top_contributor_share": round(top_share, 3),
+        "git_contribution_evenness": round(evenness, 3),
+    }
+
+
+def github_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def github_get(url: str, params: dict[str, Any] | None = None) -> tuple[Any, dict[str, Any]]:
+    response = requests.get(url, headers=github_headers(), params=params, timeout=30)
+    meta = {
+        "status_code": response.status_code,
+        "remaining": response.headers.get("X-RateLimit-Remaining"),
+    }
+    if response.status_code >= 400:
+        return None, meta
+    try:
+        return response.json(), meta
+    except ValueError:
+        return None, meta
+
+
+def list_pull_requests(owner: str, repo: str, cutoff_iso: str) -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+    page = 1
+
+    while page <= 5:
+        payload, _ = github_get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            {"state": "all", "sort": "updated", "direction": "desc", "per_page": 100, "page": page},
+        )
+        if not isinstance(payload, list):
+            break
+        if not payload:
+            break
+
+        for pr in payload:
+            created_at = pr.get("created_at")
+            if created_at and created_at <= cutoff_iso:
+                collected.append(pr)
+
+        if len(payload) < 100:
+            break
+        page += 1
+
+    return collected
+
+
+def list_reviews(owner: str, repo: str, pr_number: int, cutoff_iso: str) -> list[dict[str, Any]]:
+    payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews")
+    if not isinstance(payload, list):
+        return []
+
+    filtered: list[dict[str, Any]] = []
+    for review in payload:
+        submitted_at = review.get("submitted_at")
+        if submitted_at and submitted_at <= cutoff_iso:
+            filtered.append(review)
+
+    return filtered
+
+
+def scan_github_workflow(
+    repo: RepoSpec,
+    cutoff_str: str,
+    timezone_name: str,
+) -> dict[str, Any]:
+    owner, repo_name = parse_owner_repo(repo.repo_url)
+
+    cutoff_dt = datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=ZoneInfo(timezone_name)
+    )
+    cutoff_iso = cutoff_dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    prs = list_pull_requests(owner, repo_name, cutoff_iso)
+    if not prs:
+        return {
+            "github_prs_found": 0,
+            "github_unique_pr_authors": 0,
+            "github_unique_reviewers": 0,
+            "github_approvals_found": 0,
+            "github_self_merge_ratio": None,
+            "github_api_used": 1,
+            "github_api_authenticated": int(bool(os.getenv("GITHUB_TOKEN", "").strip())),
+        }
+
+    pr_authors: set[str] = set()
+    reviewers: set[str] = set()
+    approvals_found = 0
+    self_merges = 0
+
+    for pr in prs:
+        author_login = (pr.get("user") or {}).get("login")
+        if author_login:
+            pr_authors.add(author_login.lower())
+
+        merged_by = (pr.get("merged_by") or {}).get("login")
+        if merged_by and author_login and merged_by.lower() == author_login.lower():
+            self_merges += 1
+
+        number = pr.get("number")
+        if number is not None:
+            reviews = list_reviews(owner, repo_name, int(number), cutoff_iso)
+            for review in reviews:
+                reviewer_login = (review.get("user") or {}).get("login")
+                if reviewer_login:
+                    reviewers.add(reviewer_login.lower())
+                if review.get("state") == "APPROVED":
+                    approvals_found += 1
+
+    return {
+        "github_prs_found": len(prs),
+        "github_unique_pr_authors": len(pr_authors),
+        "github_unique_reviewers": len(reviewers),
+        "github_approvals_found": approvals_found,
+        "github_self_merge_ratio": round(self_merges / max(len(prs), 1), 3),
+        "github_api_used": 1,
+        "github_api_authenticated": int(bool(os.getenv("GITHUB_TOKEN", "").strip())),
+    }
+
+
+def collect_evidence(
+    repo_dir: Path,
+    repo: RepoSpec,
+    cutoff_str: str,
+    timezone_name: str,
+    selected_dimensions: set[str],
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {}
+
+    structural_needed = {
+        "modularization",
+        "documentation",
+        "dependencies",
+        "error_handling",
+        "artifacting",
+        "pipeline",
+        "testing",
+    }
+
+    if selected_dimensions & structural_needed:
+        evidence.update(scan_repo_structure(repo_dir))
+        evidence.update(scan_readme(repo_dir))
+        evidence.update(scan_notebooks(repo_dir))
+        evidence.update(scan_python_files(repo_dir))
+        evidence.update(scan_main_entry(repo_dir))
+        evidence.update(scan_pipeline_modules(repo_dir))
+        evidence.update(scan_main_orchestration(repo_dir))
+        evidence.update(scan_module_stubness(repo_dir))
+        evidence.update(scan_artifact_contract(repo_dir))
+        evidence.update(analyze_tests(repo_dir))
+
+    if _is_selected(selected_dimensions, "dependencies"):
+        evidence.update(scan_dependency_files(repo_dir))
+
+    if _is_selected(selected_dimensions, "code_quality"):
+        evidence.update(run_ruff(repo_dir))
+        evidence.update(run_pylint(repo_dir))
+        evidence.update(run_radon(repo_dir))
+
+    if _is_selected(selected_dimensions, "testing"):
+        evidence.update(run_pytest(repo_dir))
+
+    if _is_selected(selected_dimensions, "version_control"):
+        evidence.update(scan_git_history(repo_dir))
+        evidence.update(
+            scan_github_workflow(
+                repo=repo,
+                cutoff_str=cutoff_str,
+                timezone_name=timezone_name,
+            )
+        )
+
+    return evidence
+
+
+def compute_proxy_scores(
+    evidence: dict[str, Any],
+    selected_dimensions: set[str],
+    config: dict[str, Any],
+) -> dict[str, float]:
+    scores: dict[str, float] = {}
+
+    if _is_selected(selected_dimensions, "modularization"):
+        section = cfg_get(config, "scoring.modularization", {})
+        main_entry_signal = int(evidence.get("main_entry_signal", 0) or 0)
+        core_module_count = int(evidence.get("core_module_count", 0) or 0)
+        orchestrated_module_count = int(evidence.get("orchestrated_module_count", 0) or 0)
+        stub_penalty_flag = int(evidence.get("stub_penalty_flag", 0) or 0)
+
+        score = 0.0
+        score += safe_float(cfg_get(section, "main_entry_signal", 0.0)) if main_entry_signal else 0.0
+
+        core_points = 0.0
+        for rule in cfg_get(section, "core_module_thresholds", []):
+            if core_module_count >= int(rule.get("min", 0)):
+                core_points = max(core_points, safe_float(rule.get("points", 0.0)))
+        score += core_points
+
+        orchestration_points = 0.0
+        for rule in cfg_get(section, "orchestrated_module_thresholds", []):
+            if orchestrated_module_count >= int(rule.get("min", 0)):
+                orchestration_points = max(orchestration_points, safe_float(rule.get("points", 0.0)))
+        score += orchestration_points
+
+        if stub_penalty_flag:
+            score -= safe_float(cfg_get(section, "stub_penalty", 0.0))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["modularization"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "code_quality"):
+        section = cfg_get(config, "scoring.code_quality", {})
+        ruff_value = evidence.get("ruff_issue_count", None)
+        ruff_issues = 999.0 if ruff_value is None else float(ruff_value)
+
+        pylint_score = float(evidence.get("pylint_score", 0.0) or 0.0)
+        radon_avg = float(evidence.get("radon_average_cc", 20.0) or 20.0)
+
+        score = safe_float(cfg_get(section, "base_score", 10.0))
+        score -= min(safe_float(cfg_get(section, "ruff_cap", 0.0)), ruff_issues * safe_float(cfg_get(section, "ruff_per_issue", 0.0)))
+        score -= max(0.0, (safe_float(cfg_get(section, "pylint_target", 0.0)) - pylint_score) * safe_float(cfg_get(section, "pylint_gap_weight", 0.0)))
+        score -= max(0.0, (radon_avg - safe_float(cfg_get(section, "radon_baseline", 0.0))) * safe_float(cfg_get(section, "radon_gap_weight", 0.0)))
+        scores[DIMENSION_TO_SCORE_COLUMN["code_quality"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "documentation"):
+        section = cfg_get(config, "scoring.documentation", {})
+        readme_present = float(evidence.get("readme_present", 0) or 0)
+        readme_run_instructions_present = float(
+            evidence.get("readme_run_instructions_present", 0) or 0
+        )
+        function_doc_ratio = float(evidence.get("function_docstring_ratio", 0.0) or 0.0)
+
+        score = 0.0
+        score += safe_float(cfg_get(section, "readme_present", 0.0)) if readme_present else 0.0
+        score += (
+            safe_float(cfg_get(section, "run_instructions_present", 0.0))
+            if readme_run_instructions_present
+            else 0.0
+        )
+        score += min(
+            safe_float(cfg_get(section, "function_doc_ratio_cap", 0.0)),
+            function_doc_ratio * safe_float(cfg_get(section, "function_doc_ratio_weight", 0.0)),
+        )
+        scores[DIMENSION_TO_SCORE_COLUMN["documentation"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "testing"):
+        section = cfg_get(config, "scoring.testing", {})
+        pytest_passed = int(evidence.get("pytest_passed", 0) or 0)
+        pytest_total_count = int(evidence.get("pytest_total_count", 0) or 0)
+        pytest_pass_rate = evidence.get("pytest_pass_rate")
+        coverage_pct = evidence.get("coverage_pct")
+        import_error = int(evidence.get("pytest_import_error", 0) or 0)
+        timeout_error = int(evidence.get("pytest_timeout", 0) or 0)
+
+        pytest_weight = safe_float(
+            cfg_get(section, "pytest_pass_rate_weight", cfg_get(section, "pytest_passed", 0.0))
+        )
+
+        score = 0.0
+
+        if pytest_total_count > 0 and isinstance(pytest_pass_rate, (int, float)):
+            score += pytest_weight * float(pytest_pass_rate)
+        elif pytest_passed:
+            score += pytest_weight
+
+        if isinstance(coverage_pct, (int, float)):
+            score += min(
+                safe_float(cfg_get(section, "coverage_cap", 0.0)),
+                float(coverage_pct) / safe_float(cfg_get(section, "coverage_divisor", 1.0)),
+            )
+
+        if import_error or timeout_error:
+            score = min(score, safe_float(cfg_get(section, "environment_cap", 10.0)))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["testing"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "dependencies"):
+        section = cfg_get(config, "scoring.dependencies", {})
+        env_present = int(evidence.get("environment_yml_present", 0) or 0)
+        conda_present = int(evidence.get("conda_yml_present", 0) or 0)
+
+        score = 0.0
+        score += (
+            safe_float(cfg_get(section, "env_or_conda_present", 0.0))
+            if (env_present or conda_present)
+            else 0.0
+        )
+        scores[DIMENSION_TO_SCORE_COLUMN["dependencies"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "error_handling"):
+        section = cfg_get(config, "scoring.error_handling", {})
+
+        signal_names = [
+            "validation_function_present",
+            "validation_raise_present",
+            "validation_none_or_type_guard",
+            "validation_empty_guard",
+            "validation_required_columns_guard",
+            "validation_missing_values_guard",
+            "validation_target_guard",
+            "validation_dtype_guard",
+            "validation_range_or_domain_guard",
+        ]
+
+        score = 0.0
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        advanced_guard_count = sum(
+            int(evidence.get(name, 0) or 0)
+            for name in [
+                "validation_target_guard",
+                "validation_dtype_guard",
+                "validation_range_or_domain_guard",
+            ]
+        )
+
+        foundation_ok = all(
+            int(evidence.get(name, 0) or 0)
+            for name in [
+                "validation_function_present",
+                "validation_raise_present",
+            ]
+        )
+
+        if advanced_guard_count == 0:
+            score = min(score, safe_float(cfg_get(section, "no_advanced_validation_cap", 10.0)))
+
+        if not foundation_ok:
+            score = min(score, safe_float(cfg_get(section, "missing_foundation_cap", 10.0)))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["error_handling"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "artifacting"):
+        section = cfg_get(config, "scoring.artifacting", {})
+
+        signal_names = [
+            "processed_data_artifact_present",
+            "model_artifact_present",
+            "prediction_artifact_present",
+            "structured_asset_paths_present",
+        ]
+
+        score = 0.0
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        if not int(evidence.get("model_artifact_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_model_artifact_cap", 10.0)))
+
+        if not int(evidence.get("prediction_artifact_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_prediction_artifact_cap", 10.0)))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["artifacting"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "pipeline"):
+        section = cfg_get(config, "scoring.pipeline", {})
+        valid_target_notebooks_with_src_import = int(
+            evidence.get("valid_target_notebooks_with_src_import", 0) or 0
+        )
+
+        score = 0.0
+        if valid_target_notebooks_with_src_import >= 1:
+            score += safe_float(cfg_get(section, "valid_target_notebook_present", 0.0))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["pipeline"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "version_control"):
+        section = cfg_get(config, "scoring.version_control", {})
+        github_prs_found = int(evidence.get("github_prs_found", 0) or 0)
+        github_unique_pr_authors = int(evidence.get("github_unique_pr_authors", 0) or 0)
+        github_unique_reviewers = int(evidence.get("github_unique_reviewers", 0) or 0)
+
+        score = 0.0
+
+        if (
+            github_unique_pr_authors >= int(cfg_get(section, "strong_min_pr_authors", 5))
+            and github_prs_found >= int(cfg_get(section, "strong_min_prs", 5))
+            and github_unique_reviewers >= int(cfg_get(section, "strong_min_reviewers", 3))
+        ):
+            score = 10.0
+        elif (
+            github_unique_pr_authors >= int(cfg_get(section, "good_min_pr_authors", 4))
+            and github_prs_found >= int(cfg_get(section, "good_min_prs", 4))
+        ):
+            score = 8.0
+        elif (
+            github_unique_pr_authors >= int(cfg_get(section, "basic_min_pr_authors", 3))
+            and github_prs_found >= int(cfg_get(section, "basic_min_prs", 3))
+        ):
+            score = 6.0
+        elif (
+            github_unique_pr_authors >= int(cfg_get(section, "limited_min_pr_authors", 2))
+            and github_prs_found >= int(cfg_get(section, "limited_min_prs", 2))
+        ):
+            score = 4.0
+        elif (
+            github_unique_pr_authors >= int(cfg_get(section, "minimal_min_pr_authors", 1))
+            and github_prs_found >= int(cfg_get(section, "minimal_min_prs", 1))
+        ):
+            score = 2.0
+        else:
+            score = 0.0
+
+        scores[DIMENSION_TO_SCORE_COLUMN["version_control"]] = round2(score)
+
+    return scores
+
+
+def make_dimension_comments(
+    evidence: dict[str, Any],
+    scores: dict[str, float],
+    selected_dimensions: set[str],
+) -> dict[str, str]:
+    comments: dict[str, str] = {}
+
+    def skipped() -> str:
+        return "SKIPPED"
+
+    if _is_selected(selected_dimensions, "modularization"):
+        entry_signal = int(evidence.get("main_entry_signal", 0) or 0)
+        core_count = int(evidence.get("core_module_count", 0) or 0)
+        orchestrated_count = int(evidence.get("orchestrated_module_count", 0) or 0)
+        stub_penalty_flag = int(evidence.get("stub_penalty_flag", 0) or 0)
+
+        if entry_signal and orchestrated_count >= 7 and not stub_penalty_flag:
+            comments["single_entry_modularization_comment"] = "Main entry point exists and the pipeline is modular and fully orchestrated end to end"
+        elif entry_signal and orchestrated_count >= 6 and not stub_penalty_flag:
+            comments["single_entry_modularization_comment"] = "Main entry point is clear and the pipeline is modular, but one core stage is not fully orchestrated from main.py"
+        elif entry_signal and core_count >= 3 and orchestrated_count >= 2:
+            comments["single_entry_modularization_comment"] = "The repo has a clear entry point and some modular orchestration, but integration is still partial"
+        else:
+            comments["single_entry_modularization_comment"] = "Single entry point or modular orchestration evidence is limited"
+    else:
+        comments["single_entry_modularization_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "code_quality"):
+        ruff_issues = int(evidence.get("ruff_issue_count", 999) or 999)
+        pylint_score = safe_float(evidence.get("pylint_score"), 0.0)
+        radon_avg = safe_float(evidence.get("radon_average_cc"), 20.0)
+
+        if ruff_issues == 0 and pylint_score >= 9.0 and radon_avg <= 5.0:
+            comments["code_quality_efficiency_comment"] = (
+                "Linting is clean, maintainability is strong, and code complexity stays low"
+            )
+        elif ruff_issues <= 10 and pylint_score >= 8.0 and radon_avg <= 7.0:
+            comments["code_quality_efficiency_comment"] = (
+                "Code quality is generally strong, with only minor style or complexity issues"
+            )
+        else:
+            comments["code_quality_efficiency_comment"] = (
+                "Code quality evidence shows notable style, maintainability, or complexity issues"
+            )
+    else:
+        comments["code_quality_efficiency_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "documentation"):
+        readme_present = int(evidence.get("readme_present", 0) or 0)
+        run_instructions_present = int(evidence.get("readme_run_instructions_present", 0) or 0)
+        function_doc_ratio = safe_float(evidence.get("function_docstring_ratio"), 0.0)
+
+        if readme_present and run_instructions_present and function_doc_ratio >= 0.9:
+            comments["documentation_clarity_comment"] = (
+                "README is present and runnable, and function docstring coverage is strong"
+            )
+        elif readme_present and function_doc_ratio >= 0.6:
+            comments["documentation_clarity_comment"] = (
+                "Documentation is useful overall, but README usage clarity or docstring coverage is still uneven"
+            )
+        else:
+            comments["documentation_clarity_comment"] = (
+                "README usage guidance or function-level documentation is too limited"
+            )
+    else:
+        comments["documentation_clarity_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "testing"):
+        pass_count = int(evidence.get("pytest_pass_count", 0) or 0)
+        total_count = int(evidence.get("pytest_total_count", 0) or 0)
+        coverage_pct = evidence.get("coverage_pct")
+
+        if evidence.get("pytest_import_error", 0):
+            comments["testing_coverage_comment"] = "Pytest evidence is unreliable because dependencies are missing in the grading environment"
+        elif evidence.get("pytest_timeout", 0):
+            comments["testing_coverage_comment"] = "Pytest timed out, so testing evidence is incomplete"
+        elif evidence.get("pytest_passed", 0):
+            if isinstance(coverage_pct, (int, float)):
+                comments["testing_coverage_comment"] = (
+                    f"Pytest runs successfully with {pass_count}/{total_count} tests passing and {round2(coverage_pct)}% coverage"
+                )
+            else:
+                comments["testing_coverage_comment"] = (
+                    f"Pytest runs successfully with {pass_count}/{total_count} tests passing"
+                )
+        elif total_count > 0 and isinstance(coverage_pct, (int, float)):
+            comments["testing_coverage_comment"] = (
+                f"Pytest ran with {pass_count}/{total_count} tests passing and {round2(coverage_pct)}% coverage"
+            )
+        elif total_count > 0:
+            comments["testing_coverage_comment"] = (
+                f"Pytest ran with {pass_count}/{total_count} tests passing, but coverage could not be read cleanly"
+            )
+        else:
+            comments["testing_coverage_comment"] = "Tests were found, but the suite did not run cleanly enough to produce usable scoring evidence"
+    else:
+        comments["testing_coverage_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "dependencies"):
+        if evidence.get("environment_yml_present", 0) or evidence.get("conda_yml_present", 0):
+            comments["dependency_management_comment"] = "Environment definition file is present"
+        else:
+            comments["dependency_management_comment"] = "No environment.yml or conda.yml file was found"
+    else:
+        comments["dependency_management_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "error_handling"):
+        function_present = int(evidence.get("validation_function_present", 0) or 0)
+        raise_present = int(evidence.get("validation_raise_present", 0) or 0)
+
+        core_guard_count = sum(
+            int(evidence.get(name, 0) or 0)
+            for name in [
+                "validation_none_or_type_guard",
+                "validation_empty_guard",
+                "validation_required_columns_guard",
+                "validation_missing_values_guard",
+            ]
+        )
+
+        advanced_guard_count = sum(
+            int(evidence.get(name, 0) or 0)
+            for name in [
+                "validation_target_guard",
+                "validation_dtype_guard",
+                "validation_range_or_domain_guard",
+            ]
+        )
+
+        if function_present and raise_present and core_guard_count >= 3 and advanced_guard_count >= 2:
+            comments["error_handling_validation_comment"] = (
+                "Validation breadth is strong and covers core schema checks plus deeper dataset-specific rules"
+            )
+        elif function_present and raise_present and core_guard_count >= 2:
+            comments["error_handling_validation_comment"] = (
+                "Validation covers basic fail-fast and core schema checks, but deeper target, dtype, or domain rules are limited"
+            )
+        elif function_present or raise_present:
+            comments["error_handling_validation_comment"] = (
+                "Validation evidence is present, but it is too narrow to support comprehensive error handling"
+            )
+        else:
+            comments["error_handling_validation_comment"] = (
+                "Validation and robust error handling signals are limited"
+            )
+    else:
+        comments["error_handling_validation_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "artifacting"):
+        processed_ok = int(evidence.get("processed_data_artifact_present", 0) or 0)
+        model_ok = int(evidence.get("model_artifact_present", 0) or 0)
+        prediction_ok = int(evidence.get("prediction_artifact_present", 0) or 0)
+
+        if processed_ok and model_ok and prediction_ok:
+            comments["artifacting_reproducibility_comment"] = (
+                "main.py clearly produces processed data, a serialized model, and prediction artifacts"
+            )
+        elif model_ok and (processed_ok or prediction_ok):
+            comments["artifacting_reproducibility_comment"] = (
+                "Artifact storage is partly structured, but one core pipeline output is still missing"
+            )
+        else:
+            comments["artifacting_reproducibility_comment"] = (
+                "Artifact generation from main.py is limited or not clearly evidenced"
+            )
+    else:
+        comments["artifacting_reproducibility_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "pipeline"):
+        target_notebooks_found = int(evidence.get("target_notebooks_found", 0) or 0)
+        valid_target_notebooks = int(evidence.get("valid_target_notebooks", 0) or 0)
+        valid_target_notebooks_with_src_import = int(
+            evidence.get("valid_target_notebooks_with_src_import", 0) or 0
+        )
+
+        if valid_target_notebooks_with_src_import >= 1:
+            comments["pipeline_completeness_comment"] = "At least one valid experimentation or modular notebook was found and it imports from src"
+        elif valid_target_notebooks >= 1:
+            comments["pipeline_completeness_comment"] = "A valid target notebook was found, but it does not import from src"
+        elif target_notebooks_found >= 1:
+            comments["pipeline_completeness_comment"] = "A notebook matched the naming rule, but it could not be parsed as a valid notebook file"
+        else:
+            comments["pipeline_completeness_comment"] = "No valid experimentation or modular notebook matched the naming rule"
+    else:
+        comments["pipeline_completeness_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "version_control"):
+        api_authenticated = int(evidence.get("github_api_authenticated", 0) or 0)
+        pr_authors = int(evidence.get("github_unique_pr_authors", 0) or 0)
+        reviewers = int(evidence.get("github_unique_reviewers", 0) or 0)
+        prs = int(evidence.get("github_prs_found", 0) or 0)
+
+        if not api_authenticated:
+            comments["version_control_workflow_comment"] = "GitHub token was not detected, so Pull Request evidence may be incomplete"
+        elif pr_authors >= 5 and reviewers >= 3 and prs >= 5:
+            comments["version_control_workflow_comment"] = "Strong GitHub workflow evidence shows broad team participation through Pull Requests and reviews"
+        elif pr_authors >= 4 and prs >= 4:
+            comments["version_control_workflow_comment"] = "Good GitHub workflow evidence shows several contributors using Pull Requests, but participation is not yet near full-team"
+        elif pr_authors >= 3 and prs >= 3:
+            comments["version_control_workflow_comment"] = "Basic GitHub workflow evidence is present, but contribution coverage across the team is still partial"
+        elif pr_authors >= 1 and prs >= 1:
+            comments["version_control_workflow_comment"] = "Only limited GitHub workflow participation is evidenced"
+        else:
+            comments["version_control_workflow_comment"] = "Little or no usable Pull Request workflow evidence was found"
+    else:
+        comments["version_control_workflow_comment"] = skipped()
+
+    ran_comments = [value for key, value in comments.items() if key.endswith("_comment") and value != "SKIPPED"]
+    if ran_comments:
+        comments["overall_comment"] = "First-pass qualitative feedback generated from the selected rubric dimensions"
+    else:
+        comments["overall_comment"] = "No rubric dimensions were selected for this run"
+
+    return comments
+
+
+def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)

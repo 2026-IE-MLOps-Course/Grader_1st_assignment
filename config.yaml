@@ -1,0 +1,90 @@
+submission:
+  cutoff_datetime: "2026-03-09 23:59:59"
+  timezone: "Europe/Madrid"
+
+scoring:
+  modularization:
+    main_entry_signal: 2.0
+    core_module_thresholds:
+      - min: 5
+        points: 3.0
+      - min: 3
+        points: 2.0
+      - min: 1
+        points: 1.0
+    orchestrated_module_thresholds:
+      - min: 7
+        points: 5.0
+      - min: 6
+        points: 3.0
+      - min: 4
+        points: 2.0
+      - min: 2
+        points: 1.0
+    stub_penalty_threshold: 0.5
+    stub_penalty: 1.0
+
+  code_quality:
+    base_score: 10.0
+    ruff_per_issue: 0.05
+    ruff_cap: 2.0
+    pylint_target: 8.5
+    pylint_gap_weight: 0.3
+    radon_baseline: 5.0
+    radon_gap_weight: 0.2
+
+  documentation:
+    readme_present: 1.2
+    run_instructions_present: 1.2
+    function_doc_ratio_weight: 1.6
+    function_doc_ratio_cap: 1.6
+
+  testing:
+    pytest_pass_rate_weight: 4.0
+    coverage_cap: 6.0
+    coverage_divisor: 14.5
+    environment_cap: 6.0
+
+  dependencies:
+    env_or_conda_present: 10.0
+
+  error_handling:
+    validation_function_present: 1.0
+    validation_raise_present: 1.0
+    validation_none_or_type_guard: 1.0
+    validation_empty_guard: 1.0
+    validation_required_columns_guard: 2.0
+    validation_missing_values_guard: 1.0
+    validation_target_guard: 1.5
+    validation_dtype_guard: 1.5
+    validation_range_or_domain_guard: 1.0
+    no_advanced_validation_cap: 6.0
+    missing_foundation_cap: 6.0
+
+  artifacting:
+    processed_data_artifact_present: 2.5
+    model_artifact_present: 4.0
+    prediction_artifact_present: 2.5
+    structured_asset_paths_present: 1.0
+    missing_model_artifact_cap: 5.0
+    missing_prediction_artifact_cap: 7.5
+
+  pipeline:
+    valid_target_notebook_present: 10.0
+
+  version_control:
+    strong_min_pr_authors: 5
+    strong_min_prs: 5
+    strong_min_reviewers: 3
+
+    good_min_pr_authors: 4
+    good_min_prs: 4
+
+    basic_min_pr_authors: 3
+    basic_min_prs: 3
+
+    limited_min_pr_authors: 2
+    limited_min_prs: 2
+
+    minimal_min_pr_authors: 1
+    minimal_min_prs: 1
