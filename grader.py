@@ -48,17 +48,31 @@ DIMENSION_CHOICES = [
 ALL_DIMENSIONS = [d for d in DIMENSION_CHOICES if d != "all"]
 
 
+def documentation_score_is_qualitative_only(config: dict[str, Any]) -> bool:
+    return bool(config.get("scoring", {}).get("documentation", {}).get("qualitative_only", True))
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Grade public student repos for the 1st MLOps assignment")
-    parser.add_argument("--repos-file", default="repos.txt", help="Path to repos.txt")
-    parser.add_argument("--workdir", default="grading_workspace", help="Working directory for cloned repos")
-    parser.add_argument("--output-dir", default="outputs", help="Directory for CSV outputs")
-    parser.add_argument("--cutoff", default=DEFAULT_CUTOFF, help="Submission cutoff in local time: YYYY-MM-DD HH:MM:SS")
-    parser.add_argument("--timezone", default=DEFAULT_TIMEZONE, help="IANA timezone for the cutoff")
-    parser.add_argument("--include-benchmark", action="store_true", help="Also grade the instructor benchmark repo")
-    parser.add_argument("--benchmark-url", default=DEFAULT_BENCHMARK_URL, help="Instructor benchmark repo URL")
-    parser.add_argument("--benchmark-branch", default="main", help="Instructor benchmark repo branch")
-    parser.add_argument("--benchmark-commit", default=DEFAULT_BENCHMARK_COMMIT, help="Fixed benchmark commit")
+    parser = argparse.ArgumentParser(
+        description="Grade public student repos for the 1st MLOps assignment")
+    parser.add_argument("--repos-file", default="repos.txt",
+                        help="Path to repos.txt")
+    parser.add_argument("--workdir", default="grading_workspace",
+                        help="Working directory for cloned repos")
+    parser.add_argument("--output-dir", default="outputs",
+                        help="Directory for CSV outputs")
+    parser.add_argument("--cutoff", default=DEFAULT_CUTOFF,
+                        help="Submission cutoff in local time: YYYY-MM-DD HH:MM:SS")
+    parser.add_argument("--timezone", default=DEFAULT_TIMEZONE,
+                        help="IANA timezone for the cutoff")
+    parser.add_argument("--include-benchmark", action="store_true",
+                        help="Also grade the instructor benchmark repo")
+    parser.add_argument("--benchmark-url", default=DEFAULT_BENCHMARK_URL,
+                        help="Instructor benchmark repo URL")
+    parser.add_argument("--benchmark-branch", default="main",
+                        help="Instructor benchmark repo branch")
+    parser.add_argument(
+        "--benchmark-commit", default=DEFAULT_BENCHMARK_COMMIT, help="Fixed benchmark commit")
     parser.add_argument(
         "--dimensions",
         nargs="+",
@@ -66,7 +80,8 @@ def parse_args() -> argparse.Namespace:
         choices=DIMENSION_CHOICES,
         help="Run all checks or only selected rubric dimensions",
     )
-    parser.add_argument("--config", default="config.yaml", help="Path to grader scoring config YAML")
+    parser.add_argument("--config", default="config.yaml",
+                        help="Path to grader scoring config YAML")
     parser.add_argument(
         "--local-repo-path",
         default=None,
@@ -103,10 +118,12 @@ def prepare_repo_specs(args: argparse.Namespace) -> list[RepoSpec]:
         )
     return repo_specs
 
+
 def prepare_local_repo_spec(local_repo_path: str) -> tuple[RepoSpec, Path]:
     repo_dir = Path(local_repo_path).resolve()
     if not repo_dir.exists() or not repo_dir.is_dir():
-        raise SystemExit(f"Local repo path does not exist or is not a directory: {repo_dir}")
+        raise SystemExit(
+            f"Local repo path does not exist or is not a directory: {repo_dir}")
 
     repo_id = repo_dir.name
     repo = RepoSpec(
@@ -117,6 +134,7 @@ def prepare_local_repo_spec(local_repo_path: str) -> tuple[RepoSpec, Path]:
         is_benchmark=False,
     )
     return repo, repo_dir
+
 
 def empty_score_payload() -> dict[str, Any]:
     payload: dict[str, Any] = {}
@@ -137,7 +155,8 @@ def grade_single_repo(
     effective_cutoff = args.cutoff
     effective_timezone = args.timezone
 
-    commit = repo.fixed_commit or resolve_cutoff_commit(repo_dir, repo.branch, effective_cutoff, effective_timezone)
+    commit = repo.fixed_commit or resolve_cutoff_commit(
+        repo_dir, repo.branch, effective_cutoff, effective_timezone)
     checkout_commit(repo_dir, commit)
 
     metadata = git_commit_metadata(repo_dir, commit)
@@ -159,9 +178,11 @@ def grade_single_repo(
             "dimensions_run": ",".join(sorted(selected_dimensions)),
         }
     )
-    evidence = slim_evidence_for_selected_dimensions(evidence, selected_dimensions, config)
+    evidence = slim_evidence_for_selected_dimensions(
+        evidence, selected_dimensions, config)
 
-    scores = compute_proxy_scores(evidence=evidence, selected_dimensions=selected_dimensions, config=config)
+    scores = compute_proxy_scores(
+        evidence=evidence, selected_dimensions=selected_dimensions, config=config)
     comments = make_dimension_comments(
         evidence=evidence,
         scores=scores,
@@ -179,8 +200,12 @@ def grade_single_repo(
 
     total = 0.0
     ran_any = False
+    docs_qualitative_only = documentation_score_is_qualitative_only(config)
     for dimension, score_col in DIMENSION_TO_SCORE_COLUMN.items():
         if dimension in selected_dimensions:
+            if dimension == "documentation" and docs_qualitative_only:
+                score_row[score_col] = ""
+                continue
             value = round2(scores.get(score_col, 0.0))
             score_row[score_col] = value
             total += value
@@ -249,16 +274,19 @@ def main() -> None:
     selected_dimensions = normalize_dimensions(args.dimensions)
     config = load_grading_config(Path(args.config))
 
-    submission_cfg = config.get("submission", {}) if isinstance(config, dict) else {}
+    submission_cfg = config.get(
+        "submission", {}) if isinstance(config, dict) else {}
 
     effective_cutoff = args.cutoff or submission_cfg.get("cutoff_datetime")
     effective_timezone = args.timezone or submission_cfg.get("timezone")
 
     if not effective_cutoff:
-        raise SystemExit("Missing submission.cutoff_datetime in config.yaml and no --cutoff provided")
+        raise SystemExit(
+            "Missing submission.cutoff_datetime in config.yaml and no --cutoff provided")
 
     if not effective_timezone:
-        raise SystemExit("Missing submission.timezone in config.yaml and no --timezone provided")
+        raise SystemExit(
+            "Missing submission.timezone in config.yaml and no --timezone provided")
 
     args.cutoff = effective_cutoff
     args.timezone = effective_timezone
@@ -312,7 +340,8 @@ def main() -> None:
                         "dimensions_run": ",".join(sorted(selected_dimensions)),
                     }
                 )
-                evidence = slim_evidence_for_selected_dimensions(evidence, selected_dimensions, config)
+                evidence = slim_evidence_for_selected_dimensions(
+                    evidence, selected_dimensions, config)
                 scores = compute_proxy_scores(
                     evidence=evidence,
                     selected_dimensions=selected_dimensions,
@@ -332,6 +361,16 @@ def main() -> None:
                     **empty_score_payload(),
                     **scores,
                 }
+                score_row = {
+                    "repo_id": repo.repo_id,
+                    "repo_url": repo.repo_url,
+                    "branch": repo.branch,
+                    "cutoff_commit": commit,
+                    **empty_score_payload(),
+                    **scores,
+                }
+                if documentation_score_is_qualitative_only(config):
+                    score_row[DIMENSION_TO_SCORE_COLUMN["documentation"]] = ""
                 score_row["total_raw_score"] = round(
                     sum(
                         float(score_row[col])

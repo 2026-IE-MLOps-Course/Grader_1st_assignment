@@ -34,10 +34,8 @@ scoring:
     radon_gap_weight: 0.2
 
   documentation:
-    readme_present: 1.2
-    run_instructions_present: 1.2
-    function_doc_ratio_weight: 1.6
-    function_doc_ratio_cap: 1.6
+    qualitative_only: true
+    readme_present: 0.0
 
   testing:
     pytest_pass_rate_weight: 4.0

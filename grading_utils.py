@@ -61,8 +61,6 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
     ],
     "documentation": [
         "readme_present",
-        "readme_run_instructions_present",
-        "function_docstring_ratio",
     ],
     "testing": [
         "pytest_passed",
@@ -1686,25 +1684,14 @@ def compute_proxy_scores(
         scores[DIMENSION_TO_SCORE_COLUMN["code_quality"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "documentation"):
-        section = cfg_get(config, "scoring.documentation", {})
-        readme_present = float(evidence.get("readme_present", 0) or 0)
-        readme_run_instructions_present = float(
-            evidence.get("readme_run_instructions_present", 0) or 0
-        )
-        function_doc_ratio = float(evidence.get("function_docstring_ratio", 0.0) or 0.0)
+        qualitative_only = bool(cfg_get(config, "scoring.documentation.qualitative_only", True))
+        if not qualitative_only:
+            section = cfg_get(config, "scoring.documentation", {})
+            readme_present = float(evidence.get("readme_present", 0) or 0)
 
-        score = 0.0
-        score += safe_float(cfg_get(section, "readme_present", 0.0)) if readme_present else 0.0
-        score += (
-            safe_float(cfg_get(section, "run_instructions_present", 0.0))
-            if readme_run_instructions_present
-            else 0.0
-        )
-        score += min(
-            safe_float(cfg_get(section, "function_doc_ratio_cap", 0.0)),
-            function_doc_ratio * safe_float(cfg_get(section, "function_doc_ratio_weight", 0.0)),
-        )
-        scores[DIMENSION_TO_SCORE_COLUMN["documentation"]] = round2(clamp(score))
+            score = 0.0
+            score += safe_float(cfg_get(section, "readme_present", 0.0)) if readme_present else 0.0
+            scores[DIMENSION_TO_SCORE_COLUMN["documentation"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "testing"):
         section = cfg_get(config, "scoring.testing", {})
@@ -1921,21 +1908,11 @@ def make_dimension_comments(
 
     if _is_selected(selected_dimensions, "documentation"):
         readme_present = int(evidence.get("readme_present", 0) or 0)
-        run_instructions_present = int(evidence.get("readme_run_instructions_present", 0) or 0)
-        function_doc_ratio = safe_float(evidence.get("function_docstring_ratio"), 0.0)
 
-        if readme_present and run_instructions_present and function_doc_ratio >= 0.9:
-            comments["documentation_clarity_comment"] = (
-                "README is present and runnable, and function docstring coverage is strong"
-            )
-        elif readme_present and function_doc_ratio >= 0.6:
-            comments["documentation_clarity_comment"] = (
-                "Documentation is useful overall, but README usage clarity or docstring coverage is still uneven"
-            )
+        if readme_present:
+            comments["documentation_clarity_comment"] = "README.md exists and is ready for qualitative review"
         else:
-            comments["documentation_clarity_comment"] = (
-                "README usage guidance or function-level documentation is too limited"
-            )
+            comments["documentation_clarity_comment"] = "README.md is missing"
     else:
         comments["documentation_clarity_comment"] = skipped()
 
