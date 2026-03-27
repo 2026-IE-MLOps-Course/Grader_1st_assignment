@@ -1,0 +1,24 @@
+# 1. Ignore internal folders but keep them tracked (using .gitkeep)
+outputs/*
+!outputs/.gitkeep
+feedback/*
+!feedback/.gitkeep
+grading_workspace/*
+!grading_workspace/.gitkeep
+
+# 2. Specific hidden files to exclude
+.pylintrc
+".repos copy.txt"
+.scripts.txt
+
+# 3. Ignore Windows Alternate Data Streams (Zone Identifiers)
+*Zone.Identifier
+
+# 4. Standard Python & VS Code clutter
+__pycache__/
+*.py[cod]
+.vscode/
+.venv/
+venv/
+.env
+.pytest_cache/
