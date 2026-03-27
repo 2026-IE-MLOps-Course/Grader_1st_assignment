@@ -1,10 +1,15 @@
 # 1. Ignore internal folders but keep them tracked (using .gitkeep)
 outputs/*
 !outputs/.gitkeep
+
 feedback/*
 !feedback/.gitkeep
+
+# Track grading_workspace and its clones subfolder, but ignore all contents
 grading_workspace/*
-!grading_workspace/.gitkeep
+!grading_workspace/clones/
+grading_workspace/clones/*
+!grading_workspace/clones/.gitkeep
 
 # 2. Specific hidden files to exclude
 .pylintrc
