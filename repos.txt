@@ -16,4 +16,4 @@ https://github.com/sebog99/group6-mlops-kickoff-repo
 https://github.com/robsrot/G2_MLOPS_Project.git
 https://github.com/marcosinaniz-ai/mlops_group_1
 
-https://github.com/2026-IE-MLOps-Course/2-mlops-modularized-repo
+https://github.com/2026-IE-MLOps-Course/3-mlops-CICD.git
