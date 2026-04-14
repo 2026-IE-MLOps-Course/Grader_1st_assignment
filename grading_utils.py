@@ -41,6 +41,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "documentation": "documentation_clarity",
     "testing": "testing_coverage",
     "dependencies": "dependency_management",
+    "config_reproducibility": "config_reproducibility_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -76,6 +77,21 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
     "dependencies": [
         "environment_yml_present",
         "conda_yml_present",
+    ],
+    "config_reproducibility": [
+        "config_yaml_present",
+        "config_yaml_has_keys",
+        "runtime_config_keys_found",
+        "env_file_present",
+        "gitignore_excludes_env",
+        "environment_yml_present",
+        "conda_lock_yml_present",
+        "main_reads_config_signal",
+        "dotenv_usage_signal",
+        "code_hardcoded_path_hits",
+        "code_hardcoded_hyperparam_hits",
+        "secret_like_literal_hits",
+        "config_reproducibility_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -568,6 +584,230 @@ def _clean_python_for_detection(text: str) -> str:
     text = re.sub(r"'''[\s\S]*?'''", " ", text)
     text = re.sub(r"#.*", " ", text)
     return text.lower()
+
+
+def _is_test_or_setup_path(path: Path) -> bool:
+    lowered_parts = {part.lower() for part in path.parts}
+    lowered_name = path.name.lower()
+    lowered_stem = path.stem.lower()
+    return (
+        "tests" in lowered_parts
+        or lowered_name == "conftest.py"
+        or lowered_name == "setup.py"
+        or lowered_stem.startswith("test_")
+        or lowered_stem.endswith("_test")
+    )
+
+
+def production_python_files(repo_dir: Path) -> list[Path]:
+    return [path for path in python_files(repo_dir) if not _is_test_or_setup_path(path)]
+
+
+def _count_yaml_leaf_keys(value: Any, depth: int = 0, max_depth: int = 4) -> int:
+    if depth > max_depth:
+        return 0
+    if isinstance(value, dict):
+        total = 0
+        for child in value.values():
+            if isinstance(child, dict):
+                total += _count_yaml_leaf_keys(child, depth + 1, max_depth)
+            elif isinstance(child, list):
+                total += _count_yaml_leaf_keys(child, depth + 1, max_depth)
+            else:
+                total += 1
+        return total
+    if isinstance(value, list):
+        total = 0
+        for child in value:
+            total += _count_yaml_leaf_keys(child, depth + 1, max_depth)
+        return total
+    return 0
+
+
+def _string_literals_in_tree(tree: ast.AST) -> list[str]:
+    values: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            values.append(node.value)
+    return values
+
+
+def _path_literal_hit_count(tree: ast.AST) -> int:
+    path_re = re.compile(
+        r"(?:^|/)(?:data|models|artifacts|outputs|reports)(?:/|$)|\.(?:csv|parquet|joblib|pkl|pickle)\b",
+        flags=re.IGNORECASE,
+    )
+    hits = 0
+    for value in _string_literals_in_tree(tree):
+        literal = value.strip()
+        if path_re.search(literal):
+            hits += 1
+    return hits
+
+
+def _is_training_or_orchestration_path(path: Path) -> bool:
+    lowered = str(path).lower()
+    return any(
+        token in lowered
+        for token in [
+            "/src/",
+            "main.py",
+            "train",
+            "trainer",
+            "pipeline",
+            "model",
+            "fit",
+            "orchestr",
+        ]
+    )
+
+
+def _numeric_constant_value(node: ast.AST) -> float | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return float(node.value)
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+    ):
+        value = _numeric_constant_value(node.operand)
+        return -value if value is not None else None
+    return None
+
+
+def _hyperparameter_hit_count(tree: ast.AST) -> int:
+    target_names = {
+        "n_estimators",
+        "max_depth",
+        "learning_rate",
+        "num_leaves",
+        "min_samples_split",
+        "min_samples_leaf",
+        "subsample",
+        "colsample_bytree",
+        "reg_alpha",
+        "reg_lambda",
+        "random_state",
+        "test_size",
+        "val_size",
+        "batch_size",
+        "epochs",
+        "dropout",
+        "lr",
+    }
+    hits = 0
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value = _numeric_constant_value(node.value)
+            if value is None:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.lower() in target_names:
+                    hits += 1
+        elif isinstance(node, ast.AnnAssign):
+            value = _numeric_constant_value(node.value) if node.value is not None else None
+            if value is None:
+                continue
+            if isinstance(node.target, ast.Name) and node.target.id.lower() in target_names:
+                hits += 1
+        elif isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg and keyword.arg.lower() in target_names:
+                    value = _numeric_constant_value(keyword.value)
+                    if value is not None:
+                        hits += 1
+
+    return hits
+
+
+def _secret_like_literal_hit_count(cleaned_text: str) -> int:
+    pattern = re.compile(
+        r"\b(?:api[_-]?key|token|secret|password|passwd|client_secret|access_key)\b\s*=\s*['\"][a-z0-9_\-\/+=]{8,}['\"]"
+    )
+    return len(pattern.findall(cleaned_text))
+
+
+def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "config_yaml_present": 0,
+        "config_yaml_has_keys": 0,
+        "runtime_config_keys_found": 0,
+        "env_file_present": 0,
+        "gitignore_excludes_env": 0,
+        "environment_yml_present": 0,
+        "conda_lock_yml_present": 0,
+        "main_reads_config_signal": 0,
+        "dotenv_usage_signal": 0,
+        "code_hardcoded_path_hits": 0,
+        "code_hardcoded_hyperparam_hits": 0,
+        "secret_like_literal_hits": 0,
+        "config_reproducibility_cap_reason": "",
+    }
+
+    config_candidates = [repo_dir / "config.yaml", repo_dir / "config.yml"]
+    config_path = next((path for path in config_candidates if path.exists()), None)
+    if config_path:
+        evidence["config_yaml_present"] = 1
+        try:
+            payload = yaml.safe_load(read_text(config_path))
+        except yaml.YAMLError:
+            payload = None
+
+        if isinstance(payload, dict) and payload:
+            evidence["config_yaml_has_keys"] = 1
+            evidence["runtime_config_keys_found"] = _count_yaml_leaf_keys(payload)
+
+    evidence["env_file_present"] = int((repo_dir / ".env").exists())
+
+    gitignore_path = repo_dir / ".gitignore"
+    if gitignore_path.exists():
+        gitignore_text = read_text(gitignore_path)
+        for raw_line in gitignore_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            if line in {".env", ".env*", "*.env"}:
+                evidence["gitignore_excludes_env"] = 1
+                break
+
+    evidence["conda_lock_yml_present"] = int(any(path.is_file() for path in repo_dir.rglob("conda-lock.yml")))
+
+    main_path = _find_main_path(repo_dir)
+    if main_path and main_path.exists():
+        main_text = read_text(main_path)
+        main_clean = _clean_python_for_detection(main_text)
+        if (
+            "yaml.safe_load" in main_clean
+            or re.search(r"\byaml\.load\s*\(", main_clean)
+            or re.search(r"\bopen\s*\([^\n]{0,120}config[^\n]{0,120}\)", main_clean)
+            or re.search(r"\bload_config\s*\(", main_clean)
+            or re.search(r"\bget_config\s*\(", main_clean)
+            or re.search(r"\bconfig\s*=\s*(?:yaml\.(?:safe_load|load)|load_config|get_config)\s*\(", main_clean)
+        ):
+            evidence["main_reads_config_signal"] = 1
+
+    for path in production_python_files(repo_dir):
+        text = read_text(path)
+        cleaned = _clean_python_for_detection(text)
+
+        if "load_dotenv(" in cleaned or re.search(r"\bos\.getenv\s*\(", cleaned):
+            evidence["dotenv_usage_signal"] += 1
+
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            evidence["secret_like_literal_hits"] += _secret_like_literal_hit_count(cleaned)
+            continue
+
+        evidence["code_hardcoded_path_hits"] += _path_literal_hit_count(tree)
+        evidence["secret_like_literal_hits"] += _secret_like_literal_hit_count(cleaned)
+
+        if _is_training_or_orchestration_path(path):
+            evidence["code_hardcoded_hyperparam_hits"] += _hyperparameter_hit_count(tree)
+
+    evidence["dotenv_usage_signal"] = int(evidence["dotenv_usage_signal"] > 0)
+    return evidence
 
 def scan_validation_breadth(repo_dir: Path) -> dict[str, Any]:
     validation_paths = _validation_candidate_paths(repo_dir)
@@ -1526,6 +1766,17 @@ def scan_github_workflow(
     cutoff_str: str,
     timezone_name: str,
 ) -> dict[str, Any]:
+    if repo.repo_url.startswith("local://"):
+        return {
+            "github_prs_found": 0,
+            "github_unique_pr_authors": 0,
+            "github_unique_reviewers": 0,
+            "github_approvals_found": 0,
+            "github_self_merge_ratio": None,
+            "github_api_used": 0,
+            "github_api_authenticated": int(bool(os.getenv("GITHUB_TOKEN", "").strip())),
+        }
+
     owner, repo_name = parse_owner_repo(repo.repo_url)
 
     cutoff_dt = datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M:%S").replace(
@@ -1593,6 +1844,7 @@ def collect_evidence(
         "modularization",
         "documentation",
         "dependencies",
+        "config_reproducibility",
         "error_handling",
         "artifacting",
         "pipeline",
@@ -1611,8 +1863,14 @@ def collect_evidence(
         evidence.update(scan_artifact_contract(repo_dir))
         evidence.update(analyze_tests(repo_dir))
 
-    if _is_selected(selected_dimensions, "dependencies"):
+    if (
+        _is_selected(selected_dimensions, "dependencies")
+        or _is_selected(selected_dimensions, "config_reproducibility")
+    ):
         evidence.update(scan_dependency_files(repo_dir))
+
+    if _is_selected(selected_dimensions, "config_reproducibility"):
+        evidence.update(scan_config_reproducibility(repo_dir))
 
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
@@ -1736,6 +1994,57 @@ def compute_proxy_scores(
             else 0.0
         )
         scores[DIMENSION_TO_SCORE_COLUMN["dependencies"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "config_reproducibility"):
+        section = cfg_get(config, "scoring.config_reproducibility", {})
+
+        signal_names = [
+            "config_yaml_present",
+            "config_yaml_has_keys",
+            "environment_yml_present",
+            "conda_lock_yml_present",
+            "main_reads_config_signal",
+            "env_file_present",
+            "gitignore_excludes_env",
+            "dotenv_usage_signal",
+        ]
+
+        score = 0.0
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        runtime_config_keys_found = int(evidence.get("runtime_config_keys_found", 0) or 0)
+        if runtime_config_keys_found >= int(cfg_get(section, "runtime_config_keys_min", 0)):
+            score += safe_float(cfg_get(section, "runtime_config_keys_points", 0.0))
+
+        path_hits = int(evidence.get("code_hardcoded_path_hits", 0) or 0)
+        hyperparam_hits = int(evidence.get("code_hardcoded_hyperparam_hits", 0) or 0)
+
+        score -= min(
+            safe_float(cfg_get(section, "hardcoded_path_penalty_cap", 0.0)),
+            path_hits * safe_float(cfg_get(section, "hardcoded_path_penalty", 0.0)),
+        )
+        score -= min(
+            safe_float(cfg_get(section, "hardcoded_hyperparam_penalty_cap", 0.0)),
+            hyperparam_hits * safe_float(cfg_get(section, "hardcoded_hyperparam_penalty", 0.0)),
+        )
+
+        cap_reasons: list[str] = []
+        if not int(evidence.get("config_yaml_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_config_yaml_cap", 10.0)))
+            cap_reasons.append("missing_config_yaml")
+
+        if not int(evidence.get("conda_lock_yml_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_conda_lock_cap", 10.0)))
+            cap_reasons.append("missing_conda_lock")
+
+        if int(evidence.get("secret_like_literal_hits", 0) or 0) > 0:
+            score = min(score, safe_float(cfg_get(section, "secret_literal_cap", 10.0)))
+            cap_reasons.append("secret_like_literal")
+
+        evidence["config_reproducibility_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["config_reproducibility"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "error_handling"):
         section = cfg_get(config, "scoring.error_handling", {})
@@ -1954,6 +2263,29 @@ def make_dimension_comments(
             comments["dependency_management_comment"] = "No environment.yml or conda.yml file was found"
     else:
         comments["dependency_management_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "config_reproducibility"):
+        config_yaml_present = int(evidence.get("config_yaml_present", 0) or 0)
+        conda_lock_present = int(evidence.get("conda_lock_yml_present", 0) or 0)
+        main_reads_config = int(evidence.get("main_reads_config_signal", 0) or 0)
+        path_hits = int(evidence.get("code_hardcoded_path_hits", 0) or 0)
+        hyperparam_hits = int(evidence.get("code_hardcoded_hyperparam_hits", 0) or 0)
+        secret_hits = int(evidence.get("secret_like_literal_hits", 0) or 0)
+
+        if not config_yaml_present:
+            comments["config_reproducibility_comment"] = "config.yaml is missing, so runtime settings are not clearly centralized"
+        elif secret_hits > 0:
+            comments["config_reproducibility_comment"] = "Config centralization is undermined by secret-like literals in production code"
+        elif not conda_lock_present:
+            comments["config_reproducibility_comment"] = "Config structure is present, but conda-lock.yml is missing for stronger environment reproducibility"
+        elif not main_reads_config:
+            comments["config_reproducibility_comment"] = "config.yaml exists, but main.py does not clearly read runtime settings from it"
+        elif path_hits > 0 or hyperparam_hits > 0:
+            comments["config_reproducibility_comment"] = "Config setup is partly centralized, but hardcoded runtime paths or hyperparameters remain in production code"
+        else:
+            comments["config_reproducibility_comment"] = "Runtime settings are centralized and the environment setup is reproducibility-friendly"
+    else:
+        comments["config_reproducibility_comment"] = skipped()
 
     if _is_selected(selected_dimensions, "error_handling"):
         function_present = int(evidence.get("validation_function_present", 0) or 0)

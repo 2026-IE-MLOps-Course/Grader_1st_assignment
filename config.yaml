@@ -46,6 +46,25 @@ scoring:
   dependencies:
     env_or_conda_present: 10.0
 
+  config_reproducibility:
+    config_yaml_present: 1.5
+    config_yaml_has_keys: 0.5
+    environment_yml_present: 1.0
+    conda_lock_yml_present: 2.0
+    main_reads_config_signal: 2.0
+    env_file_present: 0.5
+    gitignore_excludes_env: 0.5
+    dotenv_usage_signal: 0.5
+    runtime_config_keys_min: 3
+    runtime_config_keys_points: 1.5
+    hardcoded_path_penalty: 0.5
+    hardcoded_path_penalty_cap: 1.5
+    hardcoded_hyperparam_penalty: 0.5
+    hardcoded_hyperparam_penalty_cap: 1.5
+    missing_config_yaml_cap: 4.0
+    missing_conda_lock_cap: 8.0
+    secret_literal_cap: 6.0
+
   error_handling:
     validation_function_present: 1.0
     validation_raise_present: 1.0
