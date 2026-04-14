@@ -1,6 +1,6 @@
 https://github.com/moanv2/1-mlops-kickoff-repo
 https://github.com/mohammedeia/1-mlops-kickoff-repo
-https://github.com/cesargrobles/session1-kickoff
+https://github.com/cesargrobles/iris-mlops.git
 https://github.com/iceman-git/1-mlops-kickoff-repo
 https://github.com/ricardo-lievano-pedroza/1-mlops-kickoff-repo
 https://github.com/rayanmazari90/1-mlops-kickoff-repo

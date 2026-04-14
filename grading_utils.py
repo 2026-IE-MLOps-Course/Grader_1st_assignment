@@ -82,7 +82,7 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "config_yaml_present",
         "config_yaml_has_keys",
         "runtime_config_keys_found",
-        "env_file_present",
+        "env_contract_signal",
         "gitignore_excludes_env",
         "environment_yml_present",
         "conda_lock_yml_present",
@@ -603,6 +603,28 @@ def production_python_files(repo_dir: Path) -> list[Path]:
     return [path for path in python_files(repo_dir) if not _is_test_or_setup_path(path)]
 
 
+def _is_runtime_owner_python_path(repo_dir: Path, path: Path) -> bool:
+    if _is_test_or_setup_path(path) or is_notebook_path(path):
+        return False
+
+    try:
+        rel_path = path.relative_to(repo_dir)
+    except ValueError:
+        rel_path = path
+
+    rel_text = str(rel_path).lower()
+    stem = path.stem.lower()
+
+    if rel_text in {"main.py", "src/main.py"}:
+        return True
+
+    return any(token in stem for token in ["train", "trainer", "pipeline", "run"])
+
+
+def runtime_owner_python_files(repo_dir: Path) -> list[Path]:
+    return [path for path in production_python_files(repo_dir) if _is_runtime_owner_python_path(repo_dir, path)]
+
+
 def _count_yaml_leaf_keys(value: Any, depth: int = 0, max_depth: int = 4) -> int:
     if depth > max_depth:
         return 0
@@ -624,42 +646,73 @@ def _count_yaml_leaf_keys(value: Any, depth: int = 0, max_depth: int = 4) -> int
     return 0
 
 
-def _string_literals_in_tree(tree: ast.AST) -> list[str]:
-    values: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            values.append(node.value)
-    return values
+def _string_constant_value(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _runtime_path_literal(value: str | None) -> bool:
+    if not value:
+        return False
+    literal = value.strip().replace("\\", "/")
+    path_re = re.compile(
+        r"^(?:data|models|artifacts|outputs|reports)/[^'\"]+\.(?:csv|parquet|joblib|pkl|pickle)$",
+        flags=re.IGNORECASE,
+    )
+    return bool(path_re.search(literal))
 
 
 def _path_literal_hit_count(tree: ast.AST) -> int:
-    path_re = re.compile(
-        r"(?:^|/)(?:data|models|artifacts|outputs|reports)(?:/|$)|\.(?:csv|parquet|joblib|pkl|pickle)\b",
-        flags=re.IGNORECASE,
-    )
     hits = 0
-    for value in _string_literals_in_tree(tree):
-        literal = value.strip()
-        if path_re.search(literal):
-            hits += 1
+    for node in ast.walk(tree):
+        literal_nodes: list[ast.AST] = []
+
+        if isinstance(node, ast.Assign):
+            literal_nodes.append(node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            literal_nodes.append(node.value)
+        elif isinstance(node, ast.Call):
+            literal_nodes.extend(
+                keyword.value for keyword in node.keywords if keyword.arg and keyword.value is not None
+            )
+
+        for literal_node in literal_nodes:
+            literal = _string_constant_value(literal_node)
+            if _runtime_path_literal(literal):
+                hits += 1
+
     return hits
 
 
-def _is_training_or_orchestration_path(path: Path) -> bool:
-    lowered = str(path).lower()
-    return any(
-        token in lowered
-        for token in [
-            "/src/",
-            "main.py",
-            "train",
-            "trainer",
-            "pipeline",
-            "model",
-            "fit",
-            "orchestr",
-        ]
-    )
+def _name_contains_config_token(name: str) -> bool:
+    lowered = name.lower()
+    return any(token in lowered for token in ["config", "cfg", "settings", "params"])
+
+
+def _value_is_config_derived(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return _name_contains_config_token(node.id)
+
+    if isinstance(node, ast.Subscript):
+        return _value_is_config_derived(node.value)
+
+    if isinstance(node, ast.Attribute):
+        if _name_contains_config_token(node.attr):
+            return True
+        return _value_is_config_derived(node.value)
+
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute):
+            return (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr == "getenv"
+            )
+        if isinstance(node.func, ast.Name):
+            return _name_contains_config_token(node.func.id)
+
+    return False
 
 
 def _numeric_constant_value(node: ast.AST) -> float | None:
@@ -693,29 +746,35 @@ def _hyperparameter_hit_count(tree: ast.AST) -> int:
         "batch_size",
         "epochs",
         "dropout",
-        "lr",
     }
     hits = 0
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
-            value = _numeric_constant_value(node.value)
-            if value is None:
+            if _value_is_config_derived(node.value):
                 continue
             for target in node.targets:
-                if isinstance(target, ast.Name) and target.id.lower() in target_names:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id.lower() in target_names
+                    and _numeric_constant_value(node.value) is not None
+                ):
                     hits += 1
         elif isinstance(node, ast.AnnAssign):
-            value = _numeric_constant_value(node.value) if node.value is not None else None
-            if value is None:
+            if node.value is None or _value_is_config_derived(node.value):
                 continue
-            if isinstance(node.target, ast.Name) and node.target.id.lower() in target_names:
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id.lower() in target_names
+                and _numeric_constant_value(node.value) is not None
+            ):
                 hits += 1
         elif isinstance(node, ast.Call):
             for keyword in node.keywords:
                 if keyword.arg and keyword.arg.lower() in target_names:
-                    value = _numeric_constant_value(keyword.value)
-                    if value is not None:
+                    if _value_is_config_derived(keyword.value):
+                        continue
+                    if _numeric_constant_value(keyword.value) is not None:
                         hits += 1
 
     return hits
@@ -733,9 +792,8 @@ def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
         "config_yaml_present": 0,
         "config_yaml_has_keys": 0,
         "runtime_config_keys_found": 0,
-        "env_file_present": 0,
+        "env_contract_signal": 0,
         "gitignore_excludes_env": 0,
-        "environment_yml_present": 0,
         "conda_lock_yml_present": 0,
         "main_reads_config_signal": 0,
         "dotenv_usage_signal": 0,
@@ -757,8 +815,6 @@ def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
         if isinstance(payload, dict) and payload:
             evidence["config_yaml_has_keys"] = 1
             evidence["runtime_config_keys_found"] = _count_yaml_leaf_keys(payload)
-
-    evidence["env_file_present"] = int((repo_dir / ".env").exists())
 
     gitignore_path = repo_dir / ".gitignore"
     if gitignore_path.exists():
@@ -783,9 +839,12 @@ def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
             or re.search(r"\bopen\s*\([^\n]{0,120}config[^\n]{0,120}\)", main_clean)
             or re.search(r"\bload_config\s*\(", main_clean)
             or re.search(r"\bget_config\s*\(", main_clean)
-            or re.search(r"\bconfig\s*=\s*(?:yaml\.(?:safe_load|load)|load_config|get_config)\s*\(", main_clean)
+            or re.search(r"\bread_config\s*\(", main_clean)
+            or re.search(r"\bconfig\s*=\s*(?:yaml\.(?:safe_load|load)|load_config|get_config|read_config)\s*\(", main_clean)
         ):
             evidence["main_reads_config_signal"] = 1
+
+    runtime_owner_paths = set(runtime_owner_python_files(repo_dir))
 
     for path in production_python_files(repo_dir):
         text = read_text(path)
@@ -800,13 +859,16 @@ def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
             evidence["secret_like_literal_hits"] += _secret_like_literal_hit_count(cleaned)
             continue
 
-        evidence["code_hardcoded_path_hits"] += _path_literal_hit_count(tree)
         evidence["secret_like_literal_hits"] += _secret_like_literal_hit_count(cleaned)
 
-        if _is_training_or_orchestration_path(path):
+        if path in runtime_owner_paths:
+            evidence["code_hardcoded_path_hits"] += _path_literal_hit_count(tree)
             evidence["code_hardcoded_hyperparam_hits"] += _hyperparameter_hit_count(tree)
 
     evidence["dotenv_usage_signal"] = int(evidence["dotenv_usage_signal"] > 0)
+    evidence["env_contract_signal"] = int(
+        evidence["gitignore_excludes_env"] and evidence["dotenv_usage_signal"]
+    )
     return evidence
 
 def scan_validation_breadth(repo_dir: Path) -> dict[str, Any]:
@@ -2004,7 +2066,7 @@ def compute_proxy_scores(
             "environment_yml_present",
             "conda_lock_yml_present",
             "main_reads_config_signal",
-            "env_file_present",
+            "env_contract_signal",
             "gitignore_excludes_env",
             "dotenv_usage_signal",
         ]

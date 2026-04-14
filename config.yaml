@@ -52,7 +52,7 @@ scoring:
     environment_yml_present: 1.0
     conda_lock_yml_present: 2.0
     main_reads_config_signal: 2.0
-    env_file_present: 0.5
+    env_contract_signal: 0.5
     gitignore_excludes_env: 0.5
     dotenv_usage_signal: 0.5
     runtime_config_keys_min: 3
