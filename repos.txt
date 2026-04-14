@@ -1,2 +1,2 @@
-https://github.com/2026-IE-MLOps-Course/2-mlops-modularized-repo
+https://github.com/2026-IE-MLOps-Course/3-mlops-CICD.git
 
