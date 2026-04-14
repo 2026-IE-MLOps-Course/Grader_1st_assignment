@@ -42,6 +42,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "testing": "testing_coverage",
     "dependencies": "dependency_management",
     "config_reproducibility": "config_reproducibility_score",
+    "security_secrets": "security_secrets_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -92,6 +93,19 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "code_hardcoded_hyperparam_hits",
         "secret_like_literal_hits",
         "config_reproducibility_cap_reason",
+    ],
+    "security_secrets": [
+        "sec_gitignore_excludes_env",
+        "sec_dockerignore_present",
+        "sec_dockerignore_excludes_env",
+        "sec_env_file_present",
+        "sec_env_file_tracked_by_git",
+        "sec_env_example_present",
+        "sec_dotenv_usage_signal",
+        "sec_secret_literal_hits",
+        "sec_secret_literal_files",
+        "sec_tracked_env_like_files",
+        "security_secrets_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -785,6 +799,234 @@ def _secret_like_literal_hit_count(cleaned_text: str) -> int:
         r"\b(?:api[_-]?key|token|secret|password|passwd|client_secret|access_key)\b\s*=\s*['\"][a-z0-9_\-\/+=]{8,}['\"]"
     )
     return len(pattern.findall(cleaned_text))
+
+
+def _scan_ignore_for_env(ignore_file_path: Path) -> int:
+    if not ignore_file_path.exists():
+        return 0
+    for raw_line in read_text(ignore_file_path).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        if line in {".env", ".env*", "*.env"}:
+            return 1
+    return 0
+
+
+def _git_ls_files(repo_dir: Path) -> list[str]:
+    result = run_command(["git", "ls-files"], cwd=repo_dir, timeout=120)
+    if not result["ok"]:
+        return []
+    return sorted(line.strip() for line in result["stdout"].splitlines() if line.strip())
+
+
+def _tracked_env_like_files(repo_dir: Path) -> list[str]:
+    safe_names = {".env.example", ".env.sample", ".env.template"}
+    risky: list[str] = []
+    for rel_path in _git_ls_files(repo_dir):
+        name = Path(rel_path).name.lower()
+        if name.startswith(".env") and name not in safe_names:
+            risky.append(rel_path)
+    return sorted(risky)
+
+
+def _tracked_source_like_files(repo_dir: Path) -> list[Path]:
+    tracked_files = _git_ls_files(repo_dir)
+    production_python_relpaths = {
+        str(path.relative_to(repo_dir)).replace("\\", "/")
+        for path in production_python_files(repo_dir)
+    }
+
+    selected: list[Path] = []
+    for rel_path in tracked_files:
+        rel_path_obj = Path(rel_path)
+        rel_text = rel_path.replace("\\", "/")
+        lowered = rel_text.lower()
+
+        if lowered in {"environment.yml", "conda-lock.yml"}:
+            continue
+        if any(part in lowered for part in ["/tests/", "/notebooks/", "/outputs/", "/feedback/", "/grading_workspace/"]):
+            continue
+        if lowered.startswith(("tests/", "notebooks/", "outputs/", "feedback/", "grading_workspace/")):
+            continue
+        if lowered.endswith((".lock", ".ipynb")):
+            continue
+
+        suffix = rel_path_obj.suffix.lower()
+        if suffix == ".py":
+            if rel_text not in production_python_relpaths:
+                continue
+        elif suffix not in {".yaml", ".yml", ".sh"}:
+            continue
+
+        selected.append(repo_dir / rel_path_obj)
+
+    return selected
+
+
+def _strip_non_python_comments(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _is_secret_like_name(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in {
+        "api_key",
+        "api-secret",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "client_secret",
+        "access_key",
+        "private_key",
+    }
+
+
+def _is_placeholder_secret_value(value: str) -> bool:
+    lowered = value.strip().lower()
+    return (
+        lowered.startswith("secrets.")
+        or lowered in {"your_token_here", "change_me", "todo"}
+        or "[" in value
+        or "]" in value
+    )
+
+
+def _is_env_reference_value(value: str) -> bool:
+    stripped = value.strip()
+    return bool(
+        re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", stripped)
+        or re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", stripped)
+    )
+
+
+def _is_env_var_name_value(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]{5,}", value.strip()))
+
+
+def _looks_like_real_secret_literal(value: str) -> bool:
+    stripped = value.strip().strip("'\"")
+    if len(stripped) < 12:
+        return False
+    if _is_placeholder_secret_value(stripped):
+        return False
+    if _is_env_reference_value(stripped):
+        return False
+    if _is_env_var_name_value(stripped):
+        return False
+    if stripped.lower().startswith("secrets."):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_./+=-]{12,}", stripped))
+
+
+def _python_secret_literal_match_count(text: str) -> int:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return 0
+
+    hits = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value = _string_constant_value(node.value)
+            if value is None or _is_placeholder_secret_value(value):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and _is_secret_like_name(target.id):
+                    hits += 1
+        elif isinstance(node, ast.AnnAssign):
+            value = _string_constant_value(node.value) if node.value is not None else None
+            if value is None or _is_placeholder_secret_value(value):
+                continue
+            if isinstance(node.target, ast.Name) and _is_secret_like_name(node.target.id):
+                hits += 1
+        elif isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                key = _string_constant_value(key_node) if key_node is not None else None
+                value = _string_constant_value(value_node)
+                if key and _is_secret_like_name(key) and value is not None and not _is_placeholder_secret_value(value):
+                    hits += 1
+
+    return hits
+
+
+def _secret_literal_match_count(text: str) -> int:
+    text = re.sub(r"\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsecrets\.[A-Za-z0-9_]+\b", " ", text, flags=re.IGNORECASE)
+    pattern = re.compile(
+        r"^(?:export\s+)?(?P<key>[A-Za-z0-9_\"'-]*(?:api[_-]?key|api-secret|token|secret|password|passwd|client_secret|access_key|private_key)[A-Za-z0-9_\"'-]*)"
+        r"\s*(?:=|:)\s*(?P<value>.+?)$",
+        flags=re.IGNORECASE,
+    )
+    hits = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = pattern.match(line)
+        if not match:
+            continue
+        key_text = match.group("key").strip().strip("'\"").lower()
+        if key_text.endswith(("_env", "_env_name", "_var")):
+            continue
+        value_text = match.group("value").strip()
+        if not _looks_like_real_secret_literal(value_text):
+            continue
+        hits += 1
+    return hits
+
+
+def scan_security_secrets(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "sec_gitignore_excludes_env": 0,
+        "sec_dockerignore_present": 0,
+        "sec_dockerignore_excludes_env": 0,
+        "sec_env_file_present": 0,
+        "sec_env_file_tracked_by_git": 0,
+        "sec_env_example_present": 0,
+        "sec_dotenv_usage_signal": 0,
+        "sec_secret_literal_hits": 0,
+        "sec_secret_literal_files": "",
+        "sec_tracked_env_like_files": "",
+        "security_secrets_cap_reason": "",
+    }
+
+    gitignore_path = repo_dir / ".gitignore"
+    dockerignore_path = repo_dir / ".dockerignore"
+    tracked_files = _git_ls_files(repo_dir)
+    tracked_env_like_files = _tracked_env_like_files(repo_dir)
+
+    evidence["sec_gitignore_excludes_env"] = _scan_ignore_for_env(gitignore_path)
+    evidence["sec_dockerignore_present"] = int(dockerignore_path.exists())
+    evidence["sec_dockerignore_excludes_env"] = _scan_ignore_for_env(dockerignore_path)
+    evidence["sec_env_file_present"] = int((repo_dir / ".env").exists())
+    evidence["sec_env_file_tracked_by_git"] = int(".env" in tracked_files)
+    evidence["sec_env_example_present"] = int((repo_dir / ".env.example").exists())
+    evidence["sec_tracked_env_like_files"] = " | ".join(tracked_env_like_files)
+
+    dotenv_hits = 0
+    for path in production_python_files(repo_dir):
+        cleaned = _clean_python_for_detection(read_text(path))
+        if "load_dotenv(" in cleaned or re.search(r"\bos\.getenv\s*\(", cleaned):
+            dotenv_hits += 1
+    evidence["sec_dotenv_usage_signal"] = int(dotenv_hits > 0)
+
+    secret_files: list[str] = []
+    secret_hits = 0
+    for path in _tracked_source_like_files(repo_dir):
+        text = read_text(path)
+        if path.suffix.lower() == ".py":
+            hits = _python_secret_literal_match_count(text)
+        else:
+            hits = _secret_literal_match_count(_strip_non_python_comments(text))
+        if hits > 0:
+            secret_hits += hits
+            secret_files.append(str(path.relative_to(repo_dir)).replace("\\", "/"))
+
+    evidence["sec_secret_literal_hits"] = secret_hits
+    evidence["sec_secret_literal_files"] = " | ".join(sorted(secret_files))
+    return evidence
 
 
 def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
@@ -1934,6 +2176,9 @@ def collect_evidence(
     if _is_selected(selected_dimensions, "config_reproducibility"):
         evidence.update(scan_config_reproducibility(repo_dir))
 
+    if _is_selected(selected_dimensions, "security_secrets"):
+        evidence.update(scan_security_secrets(repo_dir))
+
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
         evidence.update(run_pylint(repo_dir))
@@ -2107,6 +2352,37 @@ def compute_proxy_scores(
 
         evidence["config_reproducibility_cap_reason"] = "|".join(cap_reasons)
         scores[DIMENSION_TO_SCORE_COLUMN["config_reproducibility"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "security_secrets"):
+        section = cfg_get(config, "scoring.security_secrets", {})
+
+        score = 0.0
+
+        if int(evidence.get("sec_gitignore_excludes_env", 0) or 0):
+            score += safe_float(cfg_get(section, "sec_gitignore_excludes_env", 0.0))
+
+        if int(evidence.get("sec_dockerignore_excludes_env", 0) or 0):
+            score += safe_float(cfg_get(section, "sec_dockerignore_excludes_env", 0.0))
+
+        if int(evidence.get("sec_secret_literal_hits", 0) or 0) == 0:
+            score += safe_float(cfg_get(section, "sec_no_secret_literals", 0.0))
+
+        cap_reasons: list[str] = []
+
+        if int(evidence.get("sec_env_file_tracked_by_git", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "sec_tracked_env_cap", 2.0)))
+            cap_reasons.append("env_tracked_in_git")
+
+        if int(evidence.get("sec_secret_literal_hits", 0) or 0) > 0:
+            score = min(score, safe_float(cfg_get(section, "sec_secret_literal_cap", 4.0)))
+            cap_reasons.append("secret_literals_found")
+
+        if evidence.get("sec_tracked_env_like_files", ""):
+            score = min(score, safe_float(cfg_get(section, "sec_tracked_env_like_files_cap", 5.0)))
+            cap_reasons.append("env_like_files_tracked")
+
+        evidence["security_secrets_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["security_secrets"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "error_handling"):
         section = cfg_get(config, "scoring.error_handling", {})
@@ -2348,6 +2624,35 @@ def make_dimension_comments(
             comments["config_reproducibility_comment"] = "Runtime settings are centralized and the environment setup is reproducibility-friendly"
     else:
         comments["config_reproducibility_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "security_secrets"):
+        gitignore_ok = int(evidence.get("sec_gitignore_excludes_env", 0) or 0)
+        dockerignore_ok = int(evidence.get("sec_dockerignore_excludes_env", 0) or 0)
+        dockerignore_present = int(evidence.get("sec_dockerignore_present", 0) or 0)
+        env_tracked = int(evidence.get("sec_env_file_tracked_by_git", 0) or 0)
+        secret_hits = int(evidence.get("sec_secret_literal_hits", 0) or 0)
+        tracked_env_like = evidence.get("sec_tracked_env_like_files", "")
+        secret_files = evidence.get("sec_secret_literal_files", "")
+
+        if env_tracked:
+            comments["security_secrets_comment"] = ".env is tracked in git and secrets are exposed in version control"
+        elif tracked_env_like:
+            comments["security_secrets_comment"] = f"Environment-like files are tracked in git: {tracked_env_like}"
+        elif secret_hits > 0:
+            comments["security_secrets_comment"] = (
+                f"{secret_hits} secret-like literal(s) found"
+                + (f": {secret_files}" if secret_files else "")
+            )
+        elif gitignore_ok and dockerignore_ok:
+            comments["security_secrets_comment"] = ".env is excluded from both git and Docker and no secret literals were found"
+        elif gitignore_ok and not dockerignore_present:
+            comments["security_secrets_comment"] = ".env is excluded from git but .dockerignore is missing"
+        elif gitignore_ok:
+            comments["security_secrets_comment"] = ".env is excluded from git but .dockerignore does not exclude .env"
+        else:
+            comments["security_secrets_comment"] = ".env exclusion from version control is not clearly evidenced"
+    else:
+        comments["security_secrets_comment"] = skipped()
 
     if _is_selected(selected_dimensions, "error_handling"):
         function_present = int(evidence.get("validation_function_present", 0) or 0)

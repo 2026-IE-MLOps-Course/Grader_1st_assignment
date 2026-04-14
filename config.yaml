@@ -65,6 +65,14 @@ scoring:
     missing_conda_lock_cap: 8.0
     secret_literal_cap: 6.0
 
+  security_secrets:
+    sec_gitignore_excludes_env: 3.5
+    sec_dockerignore_excludes_env: 2.5
+    sec_no_secret_literals: 4.0
+    sec_tracked_env_cap: 2.0
+    sec_secret_literal_cap: 4.0
+    sec_tracked_env_like_files_cap: 5.0
+
   error_handling:
     validation_function_present: 1.0
     validation_raise_present: 1.0

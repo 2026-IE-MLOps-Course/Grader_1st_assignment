@@ -40,6 +40,7 @@ DIMENSION_CHOICES = [
     "testing",
     "dependencies",
     "config_reproducibility",
+    "security_secrets",
     "error_handling",
     "artifacting",
     "pipeline",
