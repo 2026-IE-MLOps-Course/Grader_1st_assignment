@@ -1,2 +1,19 @@
-https://github.com/2026-IE-MLOps-Course/2-mlops-modularized-repo
+https://github.com/moanv2/1-mlops-kickoff-repo
+https://github.com/mohammedeia/1-mlops-kickoff-repo
+https://github.com/cesargrobles/session1-kickoff
+https://github.com/iceman-git/1-mlops-kickoff-repo
+https://github.com/ricardo-lievano-pedroza/1-mlops-kickoff-repo
+https://github.com/rayanmazari90/1-mlops-kickoff-repo
+https://github.com/cmiebach/1-mlops-kickoff-repo/
+https://github.com/JJR9903/1-mlops-kickoff-repo
 
+https://github.com/Navenkumar-Balasubramaniam/F1-LapTime-Prediction.git
+https://github.com/npbeard/mlops-group8
+https://github.com/vik01/mlops-full
+https://github.com/edendia/Group5_Fork
+https://github.com/jclujan/my-project1-mlops
+https://github.com/sebog99/group6-mlops-kickoff-repo
+https://github.com/robsrot/G2_MLOPS_Project.git
+https://github.com/marcosinaniz-ai/mlops_group_1
+
+https://github.com/2026-IE-MLOps-Course/2-mlops-modularized-repo
