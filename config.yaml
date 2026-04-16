@@ -101,6 +101,15 @@ scoring:
     missing_eval_metrics_cap: 5.0
     missing_model_artifact_cap: 8.0
 
+  model_registry:
+    reg_serving_path_registry_backed: 7.0
+    reg_serving_prod_alias_used: 3.0
+    production_override_enabled: true
+    missing_registry_serving_cap: 2.0
+    missing_prod_alias_cap: 7.0
+    local_fallback_cap: 7.0
+    local_only_cap: 0.0
+
   error_handling:
     validation_function_present: 1.0
     validation_raise_present: 1.0

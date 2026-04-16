@@ -45,6 +45,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "security_secrets": "security_secrets_score",
     "logging_observability": "logging_observability_score",
     "experiment_tracking": "experiment_tracking_score",
+    "model_registry": "model_registry_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -134,6 +135,14 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "wandb_rich_eval_tracking_logged",
         "wandb_model_artifact_logged",
         "wandb_cap_reason",
+    ],
+    "model_registry": [
+        "reg_serving_path_registry_backed",
+        "reg_serving_prod_alias_used",
+        "reg_production_registry_selected",
+        "reg_serving_local_fallback_present",
+        "reg_serving_local_only",
+        "reg_model_registry_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -1920,6 +1929,409 @@ def scan_artifact_contract(repo_dir: Path) -> dict[str, Any]:
         "structured_asset_paths_present": structured_asset_paths_present,
     }
 
+
+def _find_api_path(repo_dir: Path) -> Path | None:
+    candidates = [repo_dir / "api.py", repo_dir / "src" / "api.py"]
+    return next((path for path in candidates if path.exists()), None)
+
+
+def _repo_config_text(repo_dir: Path) -> str:
+    config_path = repo_dir / "config.yaml"
+    if not config_path.exists():
+        return ""
+    return read_text(config_path)
+
+
+def _repo_config_payload(repo_dir: Path) -> dict[str, Any]:
+    config_path = repo_dir / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        payload = yaml.safe_load(read_text(config_path)) or {}
+    except yaml.YAMLError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _module_reference_to_path(repo_dir: Path, module_name: str) -> Path | None:
+    cleaned = module_name.strip().lstrip(".")
+    if not cleaned:
+        return None
+    parts = cleaned.split(".")
+    if parts[0] == "src":
+        candidate = repo_dir.joinpath(*parts).with_suffix(".py")
+        if candidate.exists():
+            return candidate
+        if len(parts) > 1:
+            candidate = repo_dir.joinpath(*parts[1:]).with_suffix(".py")
+            if candidate.exists():
+                return candidate
+    candidate = repo_dir.joinpath(*parts).with_suffix(".py")
+    if candidate.exists():
+        return candidate
+    if (repo_dir / "src").exists():
+        candidate = repo_dir.joinpath("src", *parts).with_suffix(".py")
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _api_helper_paths(repo_dir: Path, api_path: Path) -> list[Path]:
+    try:
+        tree = ast.parse(read_text(api_path))
+    except SyntaxError:
+        return []
+
+    called_names: set[str] = set()
+    called_modules: set[str] = set()
+    import_map: dict[str, Path] = {}
+    module_alias_map: dict[str, Path] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module_name = node.module or ""
+            if node.level and api_path.parent.name == "src" and not module_name.startswith("src"):
+                module_name = f"src.{module_name}" if module_name else "src"
+            module_path = _module_reference_to_path(repo_dir, module_name)
+            if not module_path:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                import_map[(alias.asname or alias.name).lower()] = module_path
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module_path = _module_reference_to_path(repo_dir, alias.name)
+                if not module_path:
+                    continue
+                module_alias_map[(alias.asname or alias.name.split(".")[-1]).lower()] = module_path
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called_names.add(func.id.lower())
+            elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                called_modules.add(func.value.id.lower())
+
+    helper_paths: list[Path] = []
+    for name, path in import_map.items():
+        if name in called_names and path not in helper_paths and path != api_path:
+            helper_paths.append(path)
+    for alias, path in module_alias_map.items():
+        if alias in called_modules and path not in helper_paths and path != api_path:
+            helper_paths.append(path)
+    return helper_paths
+
+
+def _registry_serving_signal(text: str) -> bool:
+    return bool(
+        re.search(r"\b\w+\.use_artifact\s*\(", text)
+        or re.search(r"\buse_artifact\s*\(", text)
+        or re.search(r"\b\w+\.artifact\s*\(", text)
+    )
+
+
+def _local_serving_signal(text: str) -> bool:
+    has_deserialize = bool(re.search(r"\b(?:joblib|pickle)\.load\s*\(", text))
+    if not has_deserialize:
+        return False
+    local_cues = [
+        "local_path",
+        "local_model_path",
+        "model_source=local",
+        "source == \"local\"",
+        "source == 'local'",
+        "loading model from local",
+        "using local model artifact",
+        "falling back to local",
+        "fallback to local",
+    ]
+    if any(cue in text for cue in local_cues):
+        return True
+    if re.search(r"os\.(?:getenv|environ\.get)\(\s*['\"]model_source['\"]\s*,\s*['\"]local['\"]\s*\)", text):
+        return True
+    return False
+
+
+def _prod_alias_signal(text: str, config_text: str) -> bool:
+    if ":prod" in text or re.search(r'["\']prod["\']', text):
+        return True
+    alias_used = bool(
+        re.search(r"\bartifact_(?:alias|ref(?:erence)?)\b", text)
+        or re.search(r"\balias\b", text)
+        or re.search(r"production_alias", text)
+        or re.search(r"artifact_alias", text)
+        or re.search(r"wandb_model_alias", text)
+    )
+    if not alias_used:
+        return False
+    return bool(re.search(r"(?im)^\s*(?:production_alias|artifact_alias)\s*:\s*[\"']?prod[\"']?\s*$", config_text))
+
+
+def _default_source_from_code_and_config(
+    combined_cleaned: str,
+    config_payload: dict[str, Any],
+) -> str | None:
+    inference_cfg = config_payload.get("inference")
+    if isinstance(inference_cfg, dict):
+        source = str(inference_cfg.get("source", "")).strip().lower()
+        if source in {"wandb", "local"}:
+            return source
+
+    default_patterns = [
+        r"os\.getenv\(\s*['\"]model_source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+        r"os\.environ\.get\(\s*['\"]model_source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+        r"getenv\(\s*['\"]model_source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+        r"get\(\s*['\"]source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+    ]
+    for pattern in default_patterns:
+        match = re.search(pattern, combined_cleaned)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _strip_non_code_comments(text: str) -> str:
+    stripped_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line
+        if "#" in line:
+            line = line.split("#", 1)[0]
+        if line.strip():
+            stripped_lines.append(line)
+    return "\n".join(stripped_lines)
+
+
+def _production_signal_files(repo_dir: Path) -> list[Path]:
+    candidates = [
+        repo_dir / "Dockerfile",
+        repo_dir / "render.yaml",
+        repo_dir / "render.yml",
+        repo_dir / "config.yaml",
+        repo_dir / "config.yml",
+    ]
+
+    workflow_dir = repo_dir / ".github" / "workflows"
+    if workflow_dir.exists():
+        candidates.extend(sorted(workflow_dir.glob("*.yml")))
+        candidates.extend(sorted(workflow_dir.glob("*.yaml")))
+
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for path in candidates:
+        if path.exists() and path not in seen:
+            existing.append(path)
+            seen.add(path)
+    return existing
+
+
+def _production_source_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bmodel_source\s*[:=]\s*[\"']?wandb[\"']?\b",
+        r"(?im)\bsource\s*:\s*wandb\b",
+        r"(?im)\binference\s*:\s*\n(?:[ \t].*\n)*?[ \t]+source\s*:\s*wandb\b",
+        r"(?im)\benv\s+model_source\s*=\s*[\"']?wandb[\"']?\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _production_prod_alias_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bwandb_model_alias\s*[:=]\s*[\"']?prod[\"']?\b",
+        r"(?im)\bmodel_alias\s*:\s*[\"']?prod[\"']?\b",
+        r"(?im)\bproduction_alias\s*:\s*[\"']?prod[\"']?\b",
+        r"(?im)\bartifact_alias\s*:\s*[\"']?prod[\"']?\b",
+        r"(?im)\benv\s+wandb_model_alias\s*=\s*[\"']?prod[\"']?\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _production_local_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bmodel_source\s*[:=]\s*[\"']?local[\"']?\b",
+        r"(?im)\bsource\s*:\s*local\b",
+        r"(?im)\binference\s*:\s*\n(?:[ \t].*\n)*?[ \t]+source\s*:\s*local\b",
+        r"(?im)\benv\s+model_source\s*=\s*[\"']?local[\"']?\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _deployment_api_start_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bstartcommand\s*:\s*.*(?:uvicorn|gunicorn).*(?:src\.)?api:app\b",
+        r"(?im)\bcmd\b.*(?:uvicorn|gunicorn).*(?:src\.)?api:app\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _wandb_runtime_env_signal(text: str) -> bool:
+    keys = ["wandb_api_key", "wandb_entity", "wandb_project"]
+    return all(key in text.lower() for key in keys)
+
+
+def _runtime_registry_prod_wiring_signal(combined_cleaned: str, config_text: str) -> bool:
+    source_switch_present = bool(
+        re.search(r"os\.(?:getenv|environ\.get)\(\s*['\"]model_source['\"]", combined_cleaned)
+        and re.search(r"if\s+model_source\s*==\s*['\"]wandb['\"]", combined_cleaned)
+    )
+    return source_switch_present and _prod_alias_signal(combined_cleaned, config_text)
+
+
+def _runtime_registry_first_prod_signal(combined_cleaned: str, config_text: str) -> bool:
+    registry_first_patterns = [
+        r"try:\s*[\s\S]{0,400}use_artifact\s*\(",
+        r"try:\s*[\s\S]{0,400}wandb\.api\(\)\s*[\s\S]{0,200}artifact\s*\(",
+        r"attempting to load model from w&b artifact \(prod\)",
+    ]
+    registry_first = any(re.search(pattern, combined_cleaned, re.I) for pattern in registry_first_patterns)
+    local_fallback = bool(re.search(r"fall(?:ing)? back to local", combined_cleaned, re.I))
+    return registry_first and local_fallback and _prod_alias_signal(combined_cleaned, config_text)
+
+
+def _production_registry_selected(
+    repo_dir: Path,
+    combined_cleaned: str,
+    config_text: str,
+) -> bool:
+    env_keys_used = {
+        key
+        for key in ["model_source", "wandb_model_alias", "artifact_alias", "production_alias", "model_alias"]
+        if key in combined_cleaned
+    }
+
+    source_selected = False
+    alias_selected = False
+    local_selected = False
+    has_runtime_container = False
+    deployment_starts_api = False
+    deployment_has_wandb_runtime = False
+
+    for path in _production_signal_files(repo_dir):
+        sanitized_text = _strip_non_code_comments(read_text(path))
+        lower_text = sanitized_text.lower()
+
+        if path.name == ".env.example":
+            if not env_keys_used:
+                continue
+            if ".env.example" not in combined_cleaned and ".env.example" not in lower_text:
+                continue
+
+        if "workflow" in path.parts and not env_keys_used.intersection({"model_source", "wandb_model_alias", "artifact_alias", "production_alias", "model_alias"}):
+            continue
+
+        if path.name == "Dockerfile":
+            has_runtime_container = True
+        if _production_source_signal(sanitized_text):
+            source_selected = True
+        if _production_prod_alias_signal(sanitized_text):
+            alias_selected = True
+        if path.name != "ci.yml" and _production_local_signal(sanitized_text):
+            local_selected = True
+        if path.suffix in {".yaml", ".yml"} and _deployment_api_start_signal(sanitized_text):
+            deployment_starts_api = True
+        if path.suffix in {".yaml", ".yml"} and _wandb_runtime_env_signal(sanitized_text):
+            deployment_has_wandb_runtime = True
+
+    if not alias_selected and _production_prod_alias_signal(config_text):
+        alias_selected = True
+
+    if not source_selected and has_runtime_container and not local_selected and _runtime_registry_prod_wiring_signal(combined_cleaned, config_text):
+        source_selected = True
+        alias_selected = True
+
+    if (
+        not source_selected
+        and deployment_starts_api
+        and deployment_has_wandb_runtime
+        and _runtime_registry_first_prod_signal(combined_cleaned, config_text)
+    ):
+        source_selected = True
+        alias_selected = True
+
+    return source_selected and alias_selected
+
+
+def scan_model_registry(repo_dir: Path) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "reg_serving_path_registry_backed": 0,
+        "reg_serving_prod_alias_used": 0,
+        "reg_production_registry_selected": 0,
+        "reg_serving_local_fallback_present": 0,
+        "reg_serving_local_only": 0,
+        "reg_model_registry_cap_reason": "",
+    }
+
+    api_path = _find_api_path(repo_dir)
+    if not api_path or not api_path.exists():
+        evidence["reg_model_registry_cap_reason"] = "no_registry_serving_path"
+        return evidence
+
+    relevant_paths = [api_path, *_api_helper_paths(repo_dir, api_path)]
+    relevant_payloads: list[tuple[Path, str, str]] = []
+    for path in relevant_paths:
+        raw_text = read_text(path)
+        relevant_payloads.append((path, raw_text, _clean_python_for_detection(raw_text)))
+
+    api_raw_text = relevant_payloads[0][1]
+    combined_cleaned = "\n".join(cleaned for _, _, cleaned in relevant_payloads)
+    config_payload = _repo_config_payload(repo_dir)
+    config_text = _repo_config_text(repo_dir)
+
+    registry_any = any(_registry_serving_signal(cleaned) for _, _, cleaned in relevant_payloads)
+    local_any = any(_local_serving_signal(cleaned) for _, _, cleaned in relevant_payloads)
+    default_source = _default_source_from_code_and_config(combined_cleaned, config_payload)
+
+    registry_first_fallback = bool(
+        registry_any
+        and local_any
+        and "except" in api_raw_text
+        and "try" in api_raw_text
+        and "wandb" in combined_cleaned
+        and "local" in combined_cleaned
+    )
+
+    if default_source == "wandb" and registry_any:
+        evidence["reg_serving_path_registry_backed"] = 1
+    elif registry_first_fallback:
+        evidence["reg_serving_path_registry_backed"] = 1
+        evidence["reg_serving_local_fallback_present"] = 1
+    elif registry_any and not local_any:
+        evidence["reg_serving_path_registry_backed"] = 1
+    elif default_source == "local" and registry_any:
+        evidence["reg_serving_local_fallback_present"] = 1
+    elif local_any and not registry_any:
+        evidence["reg_serving_local_only"] = 1
+
+    if default_source == "local" and registry_any and local_any:
+        evidence["reg_serving_local_fallback_present"] = 1
+
+    if evidence["reg_serving_local_only"] == 0 and default_source == "local" and local_any and not registry_any:
+        evidence["reg_serving_local_only"] = 1
+
+    if evidence["reg_serving_path_registry_backed"]:
+        active_registry_text = combined_cleaned
+        evidence["reg_serving_prod_alias_used"] = int(_prod_alias_signal(active_registry_text, config_text))
+        evidence["reg_production_registry_selected"] = int(
+            _production_registry_selected(repo_dir, combined_cleaned, config_text)
+        )
+
+    cap_reasons: list[str] = []
+    if registry_any and len(relevant_paths) == 1 and api_path == relevant_paths[0]:
+        pass
+    elif not registry_any and any(_registry_serving_signal(_clean_python_for_detection(read_text(path))) for path in production_python_files(repo_dir) if path not in relevant_paths):
+        cap_reasons.append("registry_helper_not_used")
+    if not evidence["reg_serving_path_registry_backed"]:
+        cap_reasons.append("no_registry_serving_path")
+    if evidence["reg_serving_path_registry_backed"] and not evidence["reg_serving_prod_alias_used"]:
+        cap_reasons.append("missing_prod_alias")
+    if evidence["reg_serving_local_fallback_present"] and not evidence["reg_production_registry_selected"]:
+        cap_reasons.append("default_or_fallback_local")
+    if evidence["reg_serving_local_only"]:
+        cap_reasons.append("local_only")
+    evidence["reg_model_registry_cap_reason"] = "|".join(cap_reasons)
+    return evidence
+
 def _extract_import_targets(tree: ast.AST) -> list[str]:
     targets: list[str] = []
 
@@ -2630,6 +3042,9 @@ def collect_evidence(
     if _is_selected(selected_dimensions, "experiment_tracking"):
         evidence.update(scan_experiment_tracking(repo_dir))
 
+    if _is_selected(selected_dimensions, "model_registry"):
+        evidence.update(scan_model_registry(repo_dir))
+
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
         evidence.update(run_pylint(repo_dir))
@@ -2923,6 +3338,43 @@ def compute_proxy_scores(
 
         evidence["wandb_cap_reason"] = "|".join(cap_reasons)
         scores[DIMENSION_TO_SCORE_COLUMN["experiment_tracking"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "model_registry"):
+        section = cfg_get(config, "scoring.model_registry", {})
+
+        score = 0.0
+        production_override_enabled = bool(cfg_get(section, "production_override_enabled", True))
+        registry_backed = int(evidence.get("reg_serving_path_registry_backed", 0) or 0)
+        prod_alias_used = int(evidence.get("reg_serving_prod_alias_used", 0) or 0)
+        production_selected = int(evidence.get("reg_production_registry_selected", 0) or 0)
+        local_fallback = int(evidence.get("reg_serving_local_fallback_present", 0) or 0)
+        local_only = int(evidence.get("reg_serving_local_only", 0) or 0)
+
+        if registry_backed:
+            score += safe_float(cfg_get(section, "reg_serving_path_registry_backed", 0.0))
+        if prod_alias_used:
+            score += safe_float(cfg_get(section, "reg_serving_prod_alias_used", 0.0))
+
+        caps: list[float] = []
+        reasons: list[str] = []
+        if local_only:
+            caps.append(safe_float(cfg_get(section, "local_only_cap", 0.0)))
+            reasons.append("local_only")
+        if not registry_backed:
+            caps.append(safe_float(cfg_get(section, "missing_registry_serving_cap", 2.0)))
+            reasons.append("no_registry_serving_path")
+        if not prod_alias_used:
+            caps.append(safe_float(cfg_get(section, "missing_prod_alias_cap", 7.0)))
+            reasons.append("missing_prod_alias")
+        if local_fallback and not (production_override_enabled and production_selected):
+            caps.append(safe_float(cfg_get(section, "local_fallback_cap", 7.0)))
+            reasons.append("default_or_fallback_local")
+
+        if caps:
+            score = min(score, min(caps))
+
+        evidence["reg_model_registry_cap_reason"] = "|".join(reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["model_registry"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "error_handling"):
         section = cfg_get(config, "scoring.error_handling", {})
@@ -3300,6 +3752,44 @@ def make_dimension_comments(
             )
     else:
         comments["experiment_tracking_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "model_registry"):
+        registry_backed = int(evidence.get("reg_serving_path_registry_backed", 0) or 0)
+        prod_alias_used = int(evidence.get("reg_serving_prod_alias_used", 0) or 0)
+        production_selected = int(evidence.get("reg_production_registry_selected", 0) or 0)
+        local_fallback = int(evidence.get("reg_serving_local_fallback_present", 0) or 0)
+        local_only = int(evidence.get("reg_serving_local_only", 0) or 0)
+
+        if local_only:
+            comments["model_registry_comment"] = (
+                "Serving loads a local unmanaged model file and no registry-backed serving path is clearly active"
+            )
+        elif registry_backed and not prod_alias_used and local_fallback:
+            comments["model_registry_comment"] = (
+                "Serving has a W&B registry branch, but defaults to a local model and does not clearly use the prod alias"
+            )
+        elif registry_backed and prod_alias_used and production_selected and local_fallback:
+            comments["model_registry_comment"] = (
+                "Production serving loads W&B prod first, but local fallback remains in the API"
+            )
+        elif registry_backed and prod_alias_used and not local_fallback:
+            comments["model_registry_comment"] = (
+                "API supports W&B prod registry serving, and deployment wiring is sufficient to treat it as the production path"
+            )
+        elif registry_backed and not prod_alias_used:
+            comments["model_registry_comment"] = (
+                "API has a W&B registry load path, but the serving alias is not clearly set to prod"
+            )
+        elif registry_backed and prod_alias_used and local_fallback:
+            comments["model_registry_comment"] = (
+                "API can load W&B prod, but serving still defaults to a local unmanaged model"
+            )
+        else:
+            comments["model_registry_comment"] = (
+                "Registry use is not clearly evidenced in the serving path"
+            )
+    else:
+        comments["model_registry_comment"] = skipped()
 
     if _is_selected(selected_dimensions, "error_handling"):
         function_present = int(evidence.get("validation_function_present", 0) or 0)

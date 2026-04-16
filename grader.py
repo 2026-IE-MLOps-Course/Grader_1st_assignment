@@ -47,6 +47,7 @@ DIMENSION_CHOICES = [
     "version_control",
     "logging_observability",
     "experiment_tracking",
+    "model_registry",
 ]
 
 ALL_DIMENSIONS = [d for d in DIMENSION_CHOICES if d != "all"]
