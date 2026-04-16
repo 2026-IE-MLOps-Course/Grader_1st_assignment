@@ -191,6 +191,7 @@ def grade_single_repo(
         evidence=evidence,
         scores=scores,
         selected_dimensions=selected_dimensions,
+        repo_dir=repo_dir,
     )
 
     score_row: dict[str, Any] = {
@@ -355,6 +356,7 @@ def main() -> None:
                     evidence=evidence,
                     scores=scores,
                     selected_dimensions=selected_dimensions,
+                    repo_dir=repo_dir,
                 )
 
                 score_row = {

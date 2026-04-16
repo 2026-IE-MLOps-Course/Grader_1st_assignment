@@ -128,7 +128,7 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
     "experiment_tracking": [
         "wandb_import_present",
         "wandb_init_in_main",
-        "wandb_project_configured",
+        "wandb_config_logged",
         "wandb_run_metadata_logged",
         "wandb_eval_metrics_logged",
         "wandb_rich_eval_tracking_logged",
@@ -1171,7 +1171,7 @@ def scan_experiment_tracking(repo_dir: Path) -> dict[str, Any]:
     evidence: dict[str, Any] = {
         "wandb_import_present": 0,
         "wandb_init_in_main": 0,
-        "wandb_project_configured": 0,
+        "wandb_config_logged": 0,
         "wandb_run_metadata_logged": 0,
         "wandb_eval_metrics_logged": 0,
         "wandb_rich_eval_tracking_logged": 0,
@@ -1199,46 +1199,60 @@ def scan_experiment_tracking(repo_dir: Path) -> dict[str, Any]:
         main_cleaned = _clean_python_for_detection(read_text(main_path))
         if "wandb.init(" in main_cleaned or re.search(r"\b\w*wandb\w*\.init\s*\(", main_cleaned):
             evidence["wandb_init_in_main"] = 1
-        if evidence["wandb_init_in_main"] and (
-            "project=" in main_cleaned
-            or 'os.getenv("WANDB_PROJECT")' in main_cleaned
-            or "os.getenv('WANDB_PROJECT')" in main_cleaned
-            or 'os.environ.get("WANDB_PROJECT")' in main_cleaned
-            or "os.environ.get('WANDB_PROJECT')" in main_cleaned
-        ):
-            evidence["wandb_project_configured"] = 1
+        if evidence["wandb_init_in_main"]:
+            idx = main_cleaned.find("wandb.init(")
+            if idx != -1:
+                window = main_cleaned[idx:idx + 800]
+                if "config=" in window:
+                    evidence["wandb_config_logged"] = 1
 
-    run_metadata_tokens = [
-        "raw_rows",
-        "raw_cols",
-        "clean_rows",
-        "clean_cols",
-        "entrypoint",
-        "model_artifact_path",
-        "train_rows",
-        "train_cols",
-        "val_rows",
-        "val_cols",
-        "test_rows",
-        "test_cols",
-        "train_size",
-        "val_size",
-        "test_size",
-        "split_size",
+    metadata_patterns = [
+        r"\braw_rows\b",
+        r"\braw_cols\b",
+        r"\bclean_rows\b",
+        r"\bclean_cols\b",
+        r"\btrain_rows\b",
+        r"\btrain_cols\b",
+        r"\btest_rows\b",
+        r"\btest_cols\b",
+        r"\bval_rows\b",
+        r"\bval_cols\b",
+        r"\btrain_size\b",
+        r"\btest_size\b",
+        r"\bval_size\b",
+        r"\bsplit(?:_| )sizes?\b",
+        r"\bselected_model_name\b",
+        r"\bentrypoint\b",
+        r"\bmodel_artifact_path\b",
     ]
-    eval_metric_tokens = [
-        "metrics/val",
-        "val_",
-        "auc",
-        "f1",
-        "precision",
-        "recall",
-        "rmse",
-        "mae",
-        "accuracy",
+    eval_namespace_patterns = [
+        r"metrics/",
+        r"\bval_",
+        r"\btest_",
+    ]
+    eval_metric_name_patterns = [
+        r"\brmse\b",
+        r"\bmae\b",
+        r"\baccuracy\b",
+        r"\bf1\b",
+        r"\bprecision\b",
+        r"\brecall\b",
+        r"\bauc\b",
+        r"\br2\b",
+    ]
+    eval_context_patterns = [
+        r"\beval",
+        r"\bevaluate",
+        r"\bevaluation\b",
+        r"\bmetric\b",
+        r"\bmetrics\b",
+        r"\bvalidation\b",
+        r"\btest\b",
+        r"\bval\b",
     ]
     rich_eval_tokens = [
         "comparison_table",
+        "comparison table",
         "confusion_matrix",
         "confusion matrix",
         "roc_curve",
@@ -1259,25 +1273,10 @@ def scan_experiment_tracking(repo_dir: Path) -> dict[str, Any]:
         "model.pt",
     ]
 
-    for cleaned in production_cleaned:
-        has_log_call = (
-            "wandb.log(" in cleaned
-            or re.search(r"\b\w*wandb\w*\.log\s*\(", cleaned)
-            or re.search(r"\b\w*run\.log\s*\(", cleaned)
-        )
-        has_summary_context = (
-            re.search(r"\b\w*wandb\w*\.summary\s*\[", cleaned)
-            or re.search(r"\b\w*run\.summary\s*\[", cleaned)
-        )
-        has_metadata_token = any(token in cleaned for token in run_metadata_tokens)
-        has_eval_metric_token = any(token in cleaned for token in eval_metric_tokens)
-        has_rich_eval_signal = (
-            "wandb.table(" in cleaned
-            or re.search(r"\b\w*wandb\w*\.table\s*\(", cleaned)
-            or "wandb.plot." in cleaned
-            or re.search(r"\b\w*wandb\w*\.plot\.", cleaned)
-            or any(token in cleaned for token in rich_eval_tokens)
-        )
+    for path in production_python_files(repo_dir):
+        text = read_text(path)
+        cleaned = _clean_python_for_detection(text)
+
         has_artifact_signal = (
             "wandb.artifact(" in cleaned
             or re.search(r"\b\w*wandb\w*\.artifact\s*\(", cleaned)
@@ -1287,20 +1286,192 @@ def scan_experiment_tracking(repo_dir: Path) -> dict[str, Any]:
             or re.search(r"\b\w*run\.log_artifact\s*\(", cleaned)
         )
         has_model_context = any(token in cleaned for token in model_context_tokens)
-
-        if has_metadata_token and (has_log_call or has_summary_context):
-            evidence["wandb_run_metadata_logged"] = 1
-
-        if has_eval_metric_token and has_log_call:
-            evidence["wandb_eval_metrics_logged"] = 1
-
-        if has_rich_eval_signal:
-            evidence["wandb_rich_eval_tracking_logged"] = 1
-
         if has_artifact_signal and has_model_context:
             evidence["wandb_model_artifact_logged"] = 1
 
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+
+        assignments = _collect_name_assignments(tree, text)
+        parent_map = _build_parent_map(tree)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _is_wandb_log_context(node):
+                is_main_file = path == main_path
+                call_context = _call_context_text(path, text, node, assignments, parent_map)
+
+                if _matches_any_pattern(call_context, metadata_patterns):
+                    evidence["wandb_run_metadata_logged"] = 1
+
+                if is_main_file:
+                    has_eval_namespace = _matches_any_pattern(call_context, eval_namespace_patterns)
+                    has_eval_metric_name = _matches_any_pattern(call_context, eval_metric_name_patterns)
+                    has_eval_context = _matches_any_pattern(call_context, eval_context_patterns)
+                    has_evaluate_model_assignment = "evaluate_model(" in call_context
+
+                    if has_eval_namespace or (has_eval_metric_name and has_eval_context) or has_evaluate_model_assignment:
+                        evidence["wandb_eval_metrics_logged"] = 1
+
+                if (
+                    not _is_config_gated_rich_tracking(node, parent_map, text)
+                    and (
+                    "wandb.table(" in call_context
+                    or "wandb.plot." in call_context
+                    or any(token in call_context for token in rich_eval_tokens)
+                    )
+                ):
+                    evidence["wandb_rich_eval_tracking_logged"] = 1
+
+            if isinstance(node, ast.Assign):
+                if any(isinstance(target, ast.Subscript) and _is_wandb_summary_context(target) for target in node.targets):
+                    summary_text = _node_text(text, node)
+                    if _matches_any_pattern(summary_text, metadata_patterns):
+                        evidence["wandb_run_metadata_logged"] = 1
+
+            if isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Subscript) and _is_wandb_summary_context(node.target):
+                    summary_text = _node_text(text, node)
+                    if _matches_any_pattern(summary_text, metadata_patterns):
+                        evidence["wandb_run_metadata_logged"] = 1
+
+            if isinstance(node, ast.Call):
+                call_text = _node_text(text, node)
+                if (
+                    not _is_config_gated_rich_tracking(node, parent_map, text)
+                    and ("wandb.table(" in call_text or "wandb.plot." in call_text)
+                ):
+                    evidence["wandb_rich_eval_tracking_logged"] = 1
+
     return evidence
+
+
+def _attribute_chain_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _attribute_chain_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def _wandb_log_context_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Call):
+        return _attribute_chain_name(node.func).lower()
+    if isinstance(node, ast.Subscript):
+        return _attribute_chain_name(node.value).lower()
+    return _attribute_chain_name(node).lower()
+
+
+def _is_wandb_log_context(node: ast.AST) -> bool:
+    context_name = _wandb_log_context_name(node)
+    if not context_name.endswith(".log"):
+        return False
+    root = context_name.split(".", 1)[0]
+    return "wandb" in context_name or root == "run" or root.endswith("_run")
+
+
+def _is_wandb_summary_context(node: ast.AST) -> bool:
+    context_name = _wandb_log_context_name(node)
+    if not context_name.endswith(".summary"):
+        return False
+    root = context_name.split(".", 1)[0]
+    return "wandb" in context_name or root == "run" or root.endswith("_run")
+
+
+def _node_text(text: str, node: ast.AST | None) -> str:
+    if node is None:
+        return ""
+    return (ast.get_source_segment(text, node) or "").lower()
+
+
+def _collect_name_assignments(tree: ast.AST, text: str) -> dict[str, list[tuple[int, str]]]:
+    assignments: dict[str, list[tuple[int, str]]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value_text = _node_text(text, node.value)
+            if not value_text:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append((node.lineno, value_text))
+        elif isinstance(node, ast.AnnAssign):
+            value_text = _node_text(text, node.value)
+            if value_text and isinstance(node.target, ast.Name):
+                assignments.setdefault(node.target.id, []).append((node.lineno, value_text))
+
+    for entries in assignments.values():
+        entries.sort(key=lambda item: item[0])
+    return assignments
+
+
+def _resolve_name_assignment(
+    name: str,
+    lineno: int,
+    assignments: dict[str, list[tuple[int, str]]],
+) -> str:
+    latest = ""
+    for assignment_lineno, assignment_text in assignments.get(name, []):
+        if assignment_lineno >= lineno:
+            break
+        latest = assignment_text
+    return latest
+
+
+def _build_parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    parent_map: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[child] = parent
+    return parent_map
+
+
+def _enclosing_function_name(node: ast.AST, parent_map: dict[ast.AST, ast.AST]) -> str:
+    current = parent_map.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current.name.lower()
+        current = parent_map.get(current)
+    return ""
+
+
+def _is_config_gated_rich_tracking(
+    node: ast.AST,
+    parent_map: dict[ast.AST, ast.AST],
+    text: str,
+) -> bool:
+    current = parent_map.get(node)
+    while current is not None:
+        if isinstance(current, ast.If):
+            test_text = _node_text(text, current.test)
+            if "cfg" in test_text or "config" in test_text:
+                return True
+        current = parent_map.get(current)
+    return False
+
+
+def _call_context_text(
+    path: Path,
+    text: str,
+    node: ast.Call,
+    assignments: dict[str, list[tuple[int, str]]],
+    parent_map: dict[ast.AST, ast.AST],
+) -> str:
+    parts = [path.stem.lower(), _enclosing_function_name(node, parent_map), _node_text(text, node)]
+
+    if node.args and isinstance(node.args[0], ast.Name):
+        parts.append(_resolve_name_assignment(node.args[0].id, node.lineno, assignments))
+
+    for keyword in node.keywords:
+        if isinstance(keyword.value, ast.Name):
+            parts.append(_resolve_name_assignment(keyword.value.id, node.lineno, assignments))
+
+    return " ".join(part for part in parts if part)
+
+
+def _matches_any_pattern(text: str, patterns: list[str]) -> bool:
+    return any(re.search(pattern, text) for pattern in patterns)
 
 
 def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
@@ -2725,8 +2896,8 @@ def compute_proxy_scores(
             score += safe_float(cfg_get(section, "wandb_import_present", 0.0))
         if int(evidence.get("wandb_init_in_main", 0) or 0):
             score += safe_float(cfg_get(section, "wandb_init_in_main", 0.0))
-        if int(evidence.get("wandb_project_configured", 0) or 0):
-            score += safe_float(cfg_get(section, "wandb_project_configured", 0.0))
+        if int(evidence.get("wandb_config_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_config_logged", 0.0))
         if int(evidence.get("wandb_run_metadata_logged", 0) or 0):
             score += safe_float(cfg_get(section, "wandb_run_metadata_logged", 0.0))
         if int(evidence.get("wandb_eval_metrics_logged", 0) or 0):
@@ -2879,6 +3050,7 @@ def make_dimension_comments(
     evidence: dict[str, Any],
     scores: dict[str, float],
     selected_dimensions: set[str],
+    repo_dir: Path | None = None,
 ) -> dict[str, str]:
     comments: dict[str, str] = {}
 
@@ -3069,36 +3241,51 @@ def make_dimension_comments(
 
     if _is_selected(selected_dimensions, "experiment_tracking"):
         init_present = int(evidence.get("wandb_init_in_main", 0) or 0)
-        project_present = int(evidence.get("wandb_project_configured", 0) or 0)
+        config_logged = int(evidence.get("wandb_config_logged", 0) or 0)
         metadata_present = int(evidence.get("wandb_run_metadata_logged", 0) or 0)
         metrics_present = int(evidence.get("wandb_eval_metrics_logged", 0) or 0)
         rich_tracking_present = int(evidence.get("wandb_rich_eval_tracking_logged", 0) or 0)
         model_artifact_present = int(evidence.get("wandb_model_artifact_logged", 0) or 0)
+        wandb_log_in_helper = False
+
+        if not metrics_present and repo_dir is not None:
+            for path in production_python_files(repo_dir):
+                if path == _find_main_path(repo_dir):
+                    continue
+                cleaned = _clean_python_for_detection(read_text(path))
+                if "wandb.log(" in cleaned:
+                    wandb_log_in_helper = True
+                    break
 
         missing_items: list[str] = []
         if not metadata_present:
             missing_items.append(
-                "run-level metadata is not clearly logged (e.g. dataset size, split info, selected model)"
+                "run-level metadata is not clearly logged to W&B (e.g. dataset size, split info, selected model, entrypoint, or model artifact path)"
             )
         if not metrics_present:
-            missing_items.append(
-                "evaluation metrics are not clearly logged (e.g. validation/test metrics)"
-            )
+            if wandb_log_in_helper:
+                missing_items.append(
+                    "Evaluation metrics are logged in a helper module rather than orchestrated from main.py. The rubric requires W&B tracking to be centrally owned by main.py."
+                )
+            else:
+                missing_items.append(
+                    "evaluation metrics are not clearly logged to W&B (e.g. metrics/, validation/test metrics, rmse, mae, accuracy, f1, precision, recall, or auc)"
+                )
         if not rich_tracking_present:
             missing_items.append(
-                "richer evaluation tracking is missing (e.g. tables, plots, or comparison artifacts)"
+                "richer W&B evaluation tracking is missing (e.g. tables, plots, confusion matrix, ROC/PR curves, or comparison tables)"
             )
         if not model_artifact_present:
             missing_items.append("model artifact logging not clearly evidenced")
 
         if not init_present:
             missing_items.insert(0, "W&B not clearly initialized from main.py")
-        if not project_present:
-            missing_items.append("project not clearly configured")
+        if not config_logged:
+            missing_items.append("full config/hyperparameters not passed to wandb.init (config= missing)")
 
         if (
             init_present
-            and project_present
+            and config_logged
             and metadata_present
             and metrics_present
             and rich_tracking_present
