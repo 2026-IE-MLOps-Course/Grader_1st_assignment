@@ -89,6 +89,18 @@ scoring:
     missing_usage_cap: 8.0
     fallback_logger_module_penalty: 1.0
 
+  experiment_tracking:
+    wandb_import_present: 0.5
+    wandb_init_in_main: 2.5
+    wandb_project_configured: 1.0
+    wandb_run_metadata_logged: 1.5
+    wandb_eval_metrics_logged: 2.0
+    wandb_rich_eval_tracking_logged: 1.0
+    wandb_model_artifact_logged: 1.5
+    missing_wandb_init_in_main_cap: 4.0
+    missing_eval_metrics_cap: 7.0
+    missing_model_artifact_cap: 8.0
+
   error_handling:
     validation_function_present: 1.0
     validation_raise_present: 1.0

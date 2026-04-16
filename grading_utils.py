@@ -44,6 +44,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "config_reproducibility": "config_reproducibility_score",
     "security_secrets": "security_secrets_score",
     "logging_observability": "logging_observability_score",
+    "experiment_tracking": "experiment_tracking_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -123,6 +124,16 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "log_logger_usage_signal",
         "log_logger_usage_count",
         "logging_observability_cap_reason",
+    ],
+    "experiment_tracking": [
+        "wandb_import_present",
+        "wandb_init_in_main",
+        "wandb_project_configured",
+        "wandb_run_metadata_logged",
+        "wandb_eval_metrics_logged",
+        "wandb_rich_eval_tracking_logged",
+        "wandb_model_artifact_logged",
+        "wandb_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -1153,6 +1164,142 @@ def scan_logging_observability(repo_dir: Path) -> dict[str, Any]:
 
     evidence["log_logger_usage_count"] = usage_count
     evidence["log_logger_usage_signal"] = int(usage_count >= 1)
+    return evidence
+
+
+def scan_experiment_tracking(repo_dir: Path) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "wandb_import_present": 0,
+        "wandb_init_in_main": 0,
+        "wandb_project_configured": 0,
+        "wandb_run_metadata_logged": 0,
+        "wandb_eval_metrics_logged": 0,
+        "wandb_rich_eval_tracking_logged": 0,
+        "wandb_model_artifact_logged": 0,
+        "wandb_cap_reason": "",
+    }
+
+    production_cleaned: list[str] = []
+    for path in production_python_files(repo_dir):
+        cleaned = _clean_python_for_detection(read_text(path))
+        production_cleaned.append(cleaned)
+
+    if any(
+        "import wandb" in cleaned
+        or "from wandb import" in cleaned
+        or 'importlib.import_module("wandb")' in cleaned
+        or "importlib.import_module('wandb')" in cleaned
+        for cleaned in production_cleaned
+    ):
+        evidence["wandb_import_present"] = 1
+
+    main_path = _find_main_path(repo_dir)
+    main_cleaned = ""
+    if main_path and main_path.exists():
+        main_cleaned = _clean_python_for_detection(read_text(main_path))
+        if "wandb.init(" in main_cleaned or re.search(r"\b\w*wandb\w*\.init\s*\(", main_cleaned):
+            evidence["wandb_init_in_main"] = 1
+        if evidence["wandb_init_in_main"] and (
+            "project=" in main_cleaned
+            or 'os.getenv("WANDB_PROJECT")' in main_cleaned
+            or "os.getenv('WANDB_PROJECT')" in main_cleaned
+            or 'os.environ.get("WANDB_PROJECT")' in main_cleaned
+            or "os.environ.get('WANDB_PROJECT')" in main_cleaned
+        ):
+            evidence["wandb_project_configured"] = 1
+
+    run_metadata_tokens = [
+        "raw_rows",
+        "raw_cols",
+        "clean_rows",
+        "clean_cols",
+        "entrypoint",
+        "model_artifact_path",
+        "train_rows",
+        "train_cols",
+        "val_rows",
+        "val_cols",
+        "test_rows",
+        "test_cols",
+        "train_size",
+        "val_size",
+        "test_size",
+        "split_size",
+    ]
+    eval_metric_tokens = [
+        "metrics/val",
+        "val_",
+        "auc",
+        "f1",
+        "precision",
+        "recall",
+        "rmse",
+        "mae",
+        "accuracy",
+    ]
+    rich_eval_tokens = [
+        "comparison_table",
+        "confusion_matrix",
+        "confusion matrix",
+        "roc_curve",
+        "roc curve",
+        "pr_curve",
+        "pr curve",
+        "calibration_table",
+        "calibration table",
+    ]
+    model_context_tokens = [
+        "type=\"model\"",
+        "type='model'",
+        "model_artifact",
+        "model artifact",
+        "model_path",
+        "model.pkl",
+        "model.joblib",
+        "model.pt",
+    ]
+
+    for cleaned in production_cleaned:
+        has_log_call = (
+            "wandb.log(" in cleaned
+            or re.search(r"\b\w*wandb\w*\.log\s*\(", cleaned)
+            or re.search(r"\b\w*run\.log\s*\(", cleaned)
+        )
+        has_summary_context = (
+            re.search(r"\b\w*wandb\w*\.summary\s*\[", cleaned)
+            or re.search(r"\b\w*run\.summary\s*\[", cleaned)
+        )
+        has_metadata_token = any(token in cleaned for token in run_metadata_tokens)
+        has_eval_metric_token = any(token in cleaned for token in eval_metric_tokens)
+        has_rich_eval_signal = (
+            "wandb.table(" in cleaned
+            or re.search(r"\b\w*wandb\w*\.table\s*\(", cleaned)
+            or "wandb.plot." in cleaned
+            or re.search(r"\b\w*wandb\w*\.plot\.", cleaned)
+            or any(token in cleaned for token in rich_eval_tokens)
+        )
+        has_artifact_signal = (
+            "wandb.artifact(" in cleaned
+            or re.search(r"\b\w*wandb\w*\.artifact\s*\(", cleaned)
+            or "log_artifact(" in cleaned
+            or "wandb.log_artifact(" in cleaned
+            or re.search(r"\b\w*wandb\w*\.log_artifact\s*\(", cleaned)
+            or re.search(r"\b\w*run\.log_artifact\s*\(", cleaned)
+        )
+        has_model_context = any(token in cleaned for token in model_context_tokens)
+
+        if has_metadata_token and (has_log_call or has_summary_context):
+            evidence["wandb_run_metadata_logged"] = 1
+
+        if has_eval_metric_token and has_log_call:
+            evidence["wandb_eval_metrics_logged"] = 1
+
+        if has_rich_eval_signal:
+            evidence["wandb_rich_eval_tracking_logged"] = 1
+
+        if has_artifact_signal and has_model_context:
+            evidence["wandb_model_artifact_logged"] = 1
+
     return evidence
 
 
@@ -2309,6 +2456,9 @@ def collect_evidence(
     if _is_selected(selected_dimensions, "logging_observability"):
         evidence.update(scan_logging_observability(repo_dir))
 
+    if _is_selected(selected_dimensions, "experiment_tracking"):
+        evidence.update(scan_experiment_tracking(repo_dir))
+
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
         evidence.update(run_pylint(repo_dir))
@@ -2566,6 +2716,43 @@ def compute_proxy_scores(
         evidence["logging_observability_cap_reason"] = "|".join(cap_reasons)
         scores[DIMENSION_TO_SCORE_COLUMN["logging_observability"]] = round2(clamp(score))
 
+    if _is_selected(selected_dimensions, "experiment_tracking"):
+        section = cfg_get(config, "scoring.experiment_tracking", {})
+
+        score = 0.0
+
+        if int(evidence.get("wandb_import_present", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_import_present", 0.0))
+        if int(evidence.get("wandb_init_in_main", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_init_in_main", 0.0))
+        if int(evidence.get("wandb_project_configured", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_project_configured", 0.0))
+        if int(evidence.get("wandb_run_metadata_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_run_metadata_logged", 0.0))
+        if int(evidence.get("wandb_eval_metrics_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_eval_metrics_logged", 0.0))
+        if int(evidence.get("wandb_rich_eval_tracking_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_rich_eval_tracking_logged", 0.0))
+        if int(evidence.get("wandb_model_artifact_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_model_artifact_logged", 0.0))
+
+        cap_reasons: list[str] = []
+
+        if not int(evidence.get("wandb_init_in_main", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_wandb_init_in_main_cap", 4.0)))
+            cap_reasons.append("missing_wandb_init_in_main")
+
+        if not int(evidence.get("wandb_eval_metrics_logged", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_eval_metrics_cap", 7.0)))
+            cap_reasons.append("missing_eval_metrics")
+
+        if not int(evidence.get("wandb_model_artifact_logged", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_model_artifact_cap", 8.0)))
+            cap_reasons.append("missing_model_artifact")
+
+        evidence["wandb_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["experiment_tracking"]] = round2(clamp(score))
+
     if _is_selected(selected_dimensions, "error_handling"):
         section = cfg_get(config, "scoring.error_handling", {})
 
@@ -2792,18 +2979,26 @@ def make_dimension_comments(
         hyperparam_hits = int(evidence.get("code_hardcoded_hyperparam_hits", 0) or 0)
         secret_hits = int(evidence.get("secret_like_literal_hits", 0) or 0)
 
+        missing_items: list[str] = []
         if not config_yaml_present:
-            comments["config_reproducibility_comment"] = "config.yaml is missing, so runtime settings are not clearly centralized"
-        elif secret_hits > 0:
-            comments["config_reproducibility_comment"] = "Config centralization is undermined by secret-like literals in production code"
-        elif not conda_lock_present:
-            comments["config_reproducibility_comment"] = "Config structure is present, but conda-lock.yml is missing for stronger environment reproducibility"
-        elif not main_reads_config:
-            comments["config_reproducibility_comment"] = "config.yaml exists, but main.py does not clearly read runtime settings from it"
-        elif path_hits > 0 or hyperparam_hits > 0:
-            comments["config_reproducibility_comment"] = "Config setup is partly centralized, but hardcoded runtime paths or hyperparameters remain in production code"
-        else:
+            missing_items.append("missing config.yaml")
+        if not conda_lock_present:
+            missing_items.append("missing conda-lock.yml")
+        if not main_reads_config:
+            missing_items.append("main.py does not clearly read config")
+        if path_hits > 0:
+            missing_items.append("hardcoded paths remain")
+        if hyperparam_hits > 0:
+            missing_items.append("hardcoded hyperparameters remain")
+        if secret_hits > 0:
+            missing_items.append("secret-like literals remain")
+
+        if not missing_items:
             comments["config_reproducibility_comment"] = "Runtime settings are centralized and the environment setup is reproducibility-friendly"
+        else:
+            comments["config_reproducibility_comment"] = (
+                "Config reproducibility gaps: " + "; ".join(missing_items)
+            )
     else:
         comments["config_reproducibility_comment"] = skipped()
 
@@ -2814,25 +3009,25 @@ def make_dimension_comments(
         env_tracked = int(evidence.get("sec_env_file_tracked_by_git", 0) or 0)
         secret_hits = int(evidence.get("sec_secret_literal_hits", 0) or 0)
         tracked_env_like = evidence.get("sec_tracked_env_like_files", "")
-        secret_files = evidence.get("sec_secret_literal_files", "")
 
+        missing_items: list[str] = []
         if env_tracked:
-            comments["security_secrets_comment"] = ".env is tracked in git and secrets are exposed in version control"
-        elif tracked_env_like:
-            comments["security_secrets_comment"] = f"Environment-like files are tracked in git: {tracked_env_like}"
-        elif secret_hits > 0:
-            comments["security_secrets_comment"] = (
-                f"{secret_hits} secret-like literal(s) found"
-                + (f": {secret_files}" if secret_files else "")
-            )
-        elif gitignore_ok and dockerignore_ok:
+            missing_items.append(".env tracked in git")
+        if tracked_env_like:
+            missing_items.append("env-like files tracked")
+        if secret_hits > 0:
+            missing_items.append("secret literals found")
+        if not gitignore_ok:
+            missing_items.append(".gitignore does not clearly exclude .env")
+        if not dockerignore_present:
+            missing_items.append(".dockerignore missing")
+        elif not dockerignore_ok:
+            missing_items.append(".dockerignore does not exclude .env")
+
+        if gitignore_ok and dockerignore_ok and secret_hits == 0 and not env_tracked and not tracked_env_like:
             comments["security_secrets_comment"] = ".env is excluded from both git and Docker and no secret literals were found"
-        elif gitignore_ok and not dockerignore_present:
-            comments["security_secrets_comment"] = ".env is excluded from git but .dockerignore is missing"
-        elif gitignore_ok:
-            comments["security_secrets_comment"] = ".env is excluded from git but .dockerignore does not exclude .env"
         else:
-            comments["security_secrets_comment"] = ".env exclusion from version control is not clearly evidenced"
+            comments["security_secrets_comment"] = "Security/secrets gaps: " + "; ".join(missing_items)
     else:
         comments["security_secrets_comment"] = skipped()
 
@@ -2847,42 +3042,77 @@ def make_dimension_comments(
         usage_signal = int(evidence.get("log_logger_usage_signal", 0) or 0)
         suffix = f" in: {print_files}" if print_files else ""
 
+        missing_items: list[str] = []
         if not logger_present:
-            comments["logging_observability_comment"] = (
-                "src/logger.py is missing, so logging is not yet structured as expected"
-            )
-        elif not dual_output:
-            missing = []
-            if not file_handler:
-                missing.append("file handler")
-            if not stream_handler:
-                missing.append("stream/console handler")
-            comments["logging_observability_comment"] = (
-                "Logger module exists, but dual output is incomplete: missing "
-                + " and ".join(missing)
-            )
-        elif not usage_signal:
-            comments["logging_observability_comment"] = (
-                "Logger is configured, but production modules do not clearly import or use it yet"
-            )
-        elif print_hits > allowed_print_calls:
-            comments["logging_observability_comment"] = (
-                f"Production code still contains {print_hits} print() call(s){suffix}, which exceeds the allowed cleanup slack of {allowed_print_calls}"
-            )
+            missing_items.append("src/logger.py missing")
+        if not file_handler:
+            missing_items.append("file handler missing")
+        if not stream_handler:
+            missing_items.append("stream/console handler missing")
+        if not usage_signal:
+            missing_items.append("logger not clearly used in production modules")
+        if print_hits > allowed_print_calls:
+            missing_items.append(f"print calls exceed allowed cleanup slack{suffix}")
         elif print_hits > 0:
-            comments["logging_observability_comment"] = (
-                f"Production code still contains {print_hits} print() call(s){suffix}, but this remains within the allowed cleanup slack and still earns full print credit"
-            )
-        elif int(evidence.get("log_logger_module_fallback_used", 0) or 0):
-            comments["logging_observability_comment"] = (
-                "Logging is well structured and used, but the logger module uses logging.py instead of the expected logger.py"
-            )
-        else:
+            missing_items.append(f"print calls remain within allowed cleanup slack{suffix}")
+        if int(evidence.get("log_logger_module_fallback_used", 0) or 0):
+            missing_items.append("logging.py used instead of expected logger.py")
+
+        if not missing_items:
             comments["logging_observability_comment"] = (
                 "Logging is production-ready: dual-output, used across production modules, and within the allowed print cleanup slack"
             )
+        else:
+            comments["logging_observability_comment"] = "Logging gaps: " + "; ".join(missing_items)
     else:
         comments["logging_observability_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "experiment_tracking"):
+        init_present = int(evidence.get("wandb_init_in_main", 0) or 0)
+        project_present = int(evidence.get("wandb_project_configured", 0) or 0)
+        metadata_present = int(evidence.get("wandb_run_metadata_logged", 0) or 0)
+        metrics_present = int(evidence.get("wandb_eval_metrics_logged", 0) or 0)
+        rich_tracking_present = int(evidence.get("wandb_rich_eval_tracking_logged", 0) or 0)
+        model_artifact_present = int(evidence.get("wandb_model_artifact_logged", 0) or 0)
+
+        missing_items: list[str] = []
+        if not metadata_present:
+            missing_items.append(
+                "run-level metadata is not clearly logged (e.g. dataset size, split info, selected model)"
+            )
+        if not metrics_present:
+            missing_items.append(
+                "evaluation metrics are not clearly logged (e.g. validation/test metrics)"
+            )
+        if not rich_tracking_present:
+            missing_items.append(
+                "richer evaluation tracking is missing (e.g. tables, plots, or comparison artifacts)"
+            )
+        if not model_artifact_present:
+            missing_items.append("model artifact logging not clearly evidenced")
+
+        if not init_present:
+            missing_items.insert(0, "W&B not clearly initialized from main.py")
+        if not project_present:
+            missing_items.append("project not clearly configured")
+
+        if (
+            init_present
+            and project_present
+            and metadata_present
+            and metrics_present
+            and rich_tracking_present
+            and model_artifact_present
+        ):
+            comments["experiment_tracking_comment"] = (
+                "W&B tracking is centrally initialized and captures run metadata, evaluation evidence, and model artifacts"
+            )
+        else:
+            comments["experiment_tracking_comment"] = (
+                "Experiment tracking gaps: " + "; ".join(missing_items)
+            )
+    else:
+        comments["experiment_tracking_comment"] = skipped()
 
     if _is_selected(selected_dimensions, "error_handling"):
         function_present = int(evidence.get("validation_function_present", 0) or 0)
