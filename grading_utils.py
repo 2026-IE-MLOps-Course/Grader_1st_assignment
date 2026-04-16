@@ -43,6 +43,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "dependencies": "dependency_management",
     "config_reproducibility": "config_reproducibility_score",
     "security_secrets": "security_secrets_score",
+    "logging_observability": "logging_observability_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -106,6 +107,22 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "sec_secret_literal_files",
         "sec_tracked_env_like_files",
         "security_secrets_cap_reason",
+    ],
+    "logging_observability": [
+        "log_print_statement_hits",
+        "log_print_free",
+        "log_print_hit_files",
+        "log_logger_module_present",
+        "log_logger_module_path",
+        "log_logger_module_name",
+        "log_logger_module_fallback_used",
+        "log_file_handler_present",
+        "log_stream_handler_present",
+        "log_dual_output_signal",
+        "log_logfile_path_present",
+        "log_logger_usage_signal",
+        "log_logger_usage_count",
+        "logging_observability_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -977,6 +994,39 @@ def _secret_literal_match_count(text: str) -> int:
     return hits
 
 
+def _count_print_calls(tree: ast.AST) -> int:
+    hits = 0
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ):
+            hits += 1
+    return hits
+
+
+def _scan_logger_module(logger_path: Path) -> dict[str, int]:
+    cleaned = _clean_python_for_detection(read_text(logger_path))
+
+    file_handler_present = int(
+        "filehandler(" in cleaned
+        or "rotatingfilehandler(" in cleaned
+        or "timedrotatingfilehandler(" in cleaned
+    )
+    stream_handler_present = int("streamhandler(" in cleaned)
+    logfile_path_present = int(
+        bool(re.search(r'["\'][^"\']*\.log["\']', cleaned))
+        or bool(re.search(r'path\s*\([^)]*\.log', cleaned))
+    )
+
+    return {
+        "log_file_handler_present": file_handler_present,
+        "log_stream_handler_present": stream_handler_present,
+        "log_logfile_path_present": logfile_path_present,
+    }
+
+
 def scan_security_secrets(repo_dir: Path) -> dict[str, Any]:
     evidence = {
         "sec_gitignore_excludes_env": 0,
@@ -1026,6 +1076,83 @@ def scan_security_secrets(repo_dir: Path) -> dict[str, Any]:
 
     evidence["sec_secret_literal_hits"] = secret_hits
     evidence["sec_secret_literal_files"] = " | ".join(sorted(secret_files))
+    return evidence
+
+
+def scan_logging_observability(repo_dir: Path) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "log_print_statement_hits": 0,
+        "log_print_free": 0,
+        "log_print_hit_files": "",
+        "log_logger_module_present": 0,
+        "log_logger_module_path": "",
+        "log_logger_module_name": "",
+        "log_logger_module_fallback_used": 0,
+        "log_file_handler_present": 0,
+        "log_stream_handler_present": 0,
+        "log_dual_output_signal": 0,
+        "log_logfile_path_present": 0,
+        "log_logger_usage_signal": 0,
+        "log_logger_usage_count": 0,
+        "logging_observability_cap_reason": "",
+    }
+
+    total_print_hits = 0
+    print_hit_files: list[str] = []
+    for path in production_python_files(repo_dir):
+        text = read_text(path)
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        hits = _count_print_calls(tree)
+        if hits > 0:
+            total_print_hits += hits
+            print_hit_files.append(str(path.relative_to(repo_dir)).replace("\\", "/"))
+
+    evidence["log_print_statement_hits"] = total_print_hits
+    allowed_print_calls = 3
+    evidence["log_print_free"] = int(total_print_hits <= allowed_print_calls)
+    evidence["log_print_hit_files"] = " | ".join(print_hit_files)
+
+    logger_path = repo_dir / "src" / "logger.py"
+    fallback_logger_path = repo_dir / "src" / "logging.py"
+    selected_logger_path: Path | None = None
+    if logger_path.exists():
+        selected_logger_path = logger_path
+        evidence["log_logger_module_present"] = 1
+        evidence["log_logger_module_path"] = "src/logger.py"
+        evidence["log_logger_module_name"] = "logger.py"
+        evidence["log_logger_module_fallback_used"] = 0
+    elif fallback_logger_path.exists():
+        selected_logger_path = fallback_logger_path
+        evidence["log_logger_module_present"] = 1
+        evidence["log_logger_module_path"] = "src/logging.py"
+        evidence["log_logger_module_name"] = "logging.py"
+        evidence["log_logger_module_fallback_used"] = 1
+
+    if selected_logger_path is not None:
+        evidence.update(_scan_logger_module(selected_logger_path))
+        evidence["log_dual_output_signal"] = int(
+            evidence["log_file_handler_present"]
+            and evidence["log_stream_handler_present"]
+        )
+
+    usage_count = 0
+    for path in production_python_files(repo_dir):
+        if selected_logger_path is not None and path.resolve() == selected_logger_path.resolve():
+            continue
+        cleaned = _clean_python_for_detection(read_text(path))
+        usage_patterns = ["get_logger(", "setup_logger(", "getlogger("]
+        if selected_logger_path == logger_path:
+            usage_patterns.extend(["from src.logger import", "import src.logger"])
+        elif selected_logger_path == fallback_logger_path:
+            usage_patterns.extend(["from src.logging import", "import src.logging"])
+        if any(pattern in cleaned for pattern in usage_patterns):
+            usage_count += 1
+
+    evidence["log_logger_usage_count"] = usage_count
+    evidence["log_logger_usage_signal"] = int(usage_count >= 1)
     return evidence
 
 
@@ -2179,6 +2306,9 @@ def collect_evidence(
     if _is_selected(selected_dimensions, "security_secrets"):
         evidence.update(scan_security_secrets(repo_dir))
 
+    if _is_selected(selected_dimensions, "logging_observability"):
+        evidence.update(scan_logging_observability(repo_dir))
+
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
         evidence.update(run_pylint(repo_dir))
@@ -2383,6 +2513,58 @@ def compute_proxy_scores(
 
         evidence["security_secrets_cap_reason"] = "|".join(cap_reasons)
         scores[DIMENSION_TO_SCORE_COLUMN["security_secrets"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "logging_observability"):
+        section = cfg_get(config, "scoring.logging_observability", {})
+
+        score = 0.0
+
+        if int(evidence.get("log_print_free", 0) or 0):
+            score += safe_float(cfg_get(section, "log_print_free", 0.0))
+
+        if int(evidence.get("log_logger_module_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_logger_module_present", 0.0))
+
+        if int(evidence.get("log_file_handler_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_file_handler_present", 0.0))
+
+        if int(evidence.get("log_stream_handler_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_stream_handler_present", 0.0))
+
+        if int(evidence.get("log_dual_output_signal", 0) or 0):
+            score += safe_float(cfg_get(section, "log_dual_output_signal", 0.0))
+
+        if int(evidence.get("log_logfile_path_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_logfile_path_present", 0.0))
+
+        if int(evidence.get("log_logger_usage_signal", 0) or 0):
+            score += safe_float(cfg_get(section, "log_logger_usage_signal", 0.0))
+
+        cap_reasons: list[str] = []
+        allowed_print_calls = int(cfg_get(section, "print_calls_allowed", 3))
+        print_hits = int(evidence.get("log_print_statement_hits", 0) or 0)
+
+        if print_hits > allowed_print_calls:
+            score = min(score, safe_float(cfg_get(section, "too_many_print_calls_cap", 5.0)))
+            cap_reasons.append("too_many_print_calls")
+
+        if int(evidence.get("log_logger_module_fallback_used", 0) or 0):
+            score -= safe_float(cfg_get(section, "fallback_logger_module_penalty", 1.0))
+
+        if not int(evidence.get("log_logger_module_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_logger_module_cap", 4.0)))
+            cap_reasons.append("missing_logger_module")
+
+        if not int(evidence.get("log_dual_output_signal", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_dual_output_cap", 6.0)))
+            cap_reasons.append("missing_dual_output")
+
+        if not int(evidence.get("log_logger_usage_signal", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_usage_cap", 8.0)))
+            cap_reasons.append("missing_usage")
+
+        evidence["logging_observability_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["logging_observability"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "error_handling"):
         section = cfg_get(config, "scoring.error_handling", {})
@@ -2653,6 +2835,54 @@ def make_dimension_comments(
             comments["security_secrets_comment"] = ".env exclusion from version control is not clearly evidenced"
     else:
         comments["security_secrets_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "logging_observability"):
+        allowed_print_calls = 3
+        print_hits = int(evidence.get("log_print_statement_hits", 0) or 0)
+        print_files = evidence.get("log_print_hit_files", "")
+        logger_present = int(evidence.get("log_logger_module_present", 0) or 0)
+        dual_output = int(evidence.get("log_dual_output_signal", 0) or 0)
+        file_handler = int(evidence.get("log_file_handler_present", 0) or 0)
+        stream_handler = int(evidence.get("log_stream_handler_present", 0) or 0)
+        usage_signal = int(evidence.get("log_logger_usage_signal", 0) or 0)
+        suffix = f" in: {print_files}" if print_files else ""
+
+        if not logger_present:
+            comments["logging_observability_comment"] = (
+                "src/logger.py is missing, so logging is not yet structured as expected"
+            )
+        elif not dual_output:
+            missing = []
+            if not file_handler:
+                missing.append("file handler")
+            if not stream_handler:
+                missing.append("stream/console handler")
+            comments["logging_observability_comment"] = (
+                "Logger module exists, but dual output is incomplete: missing "
+                + " and ".join(missing)
+            )
+        elif not usage_signal:
+            comments["logging_observability_comment"] = (
+                "Logger is configured, but production modules do not clearly import or use it yet"
+            )
+        elif print_hits > allowed_print_calls:
+            comments["logging_observability_comment"] = (
+                f"Production code still contains {print_hits} print() call(s){suffix}, which exceeds the allowed cleanup slack of {allowed_print_calls}"
+            )
+        elif print_hits > 0:
+            comments["logging_observability_comment"] = (
+                f"Production code still contains {print_hits} print() call(s){suffix}, but this remains within the allowed cleanup slack and still earns full print credit"
+            )
+        elif int(evidence.get("log_logger_module_fallback_used", 0) or 0):
+            comments["logging_observability_comment"] = (
+                "Logging is well structured and used, but the logger module uses logging.py instead of the expected logger.py"
+            )
+        else:
+            comments["logging_observability_comment"] = (
+                "Logging is production-ready: dual-output, used across production modules, and within the allowed print cleanup slack"
+            )
+    else:
+        comments["logging_observability_comment"] = skipped()
 
     if _is_selected(selected_dimensions, "error_handling"):
         function_present = int(evidence.get("validation_function_present", 0) or 0)
