@@ -46,6 +46,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "logging_observability": "logging_observability_score",
     "experiment_tracking": "experiment_tracking_score",
     "model_registry": "model_registry_score",
+    "api_serving": "api_serving_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -143,6 +144,15 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "reg_serving_local_fallback_present",
         "reg_serving_local_only",
         "reg_model_registry_cap_reason",
+    ],
+    "api_serving": [
+        "api_fastapi_app_present",
+        "api_pydantic_contract_present",
+        "api_health_endpoint_present",
+        "api_predict_endpoint_present",
+        "api_uvicorn_serving_present",
+        "api_predict_calls_inference_logic",
+        "api_serving_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -2103,6 +2113,301 @@ def _strip_non_code_comments(text: str) -> str:
     return "\n".join(stripped_lines)
 
 
+def _api_candidate_paths(repo_dir: Path) -> list[Path]:
+    candidates = [repo_dir / "src" / "api.py", repo_dir / "api.py"]
+    return [path for path in candidates if path.exists()]
+
+
+def _load_api_module(repo_dir: Path) -> tuple[Path | None, ast.AST | None]:
+    for path in _api_candidate_paths(repo_dir):
+        try:
+            return path, ast.parse(read_text(path))
+        except SyntaxError:
+            continue
+    return None, None
+
+
+def _assigned_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _call_is_fastapi(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _call_name(node.func) == "FastAPI"
+
+
+def _function_returns_fastapi(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    fastapi_bound_names: set[str] = set()
+    for node in function_node.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value if isinstance(node, ast.AnnAssign) else node.value
+            if value is None or not _call_is_fastapi(value):
+                continue
+            targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+            for target in targets:
+                assigned = _assigned_name(target)
+                if assigned:
+                    fastapi_bound_names.add(assigned)
+        elif isinstance(node, ast.Return):
+            if _call_is_fastapi(node.value):
+                return True
+            if isinstance(node.value, ast.Name) and node.value.id in fastapi_bound_names:
+                return True
+    return False
+
+
+def _fastapi_app_present(tree: ast.AST) -> bool:
+    create_app_returns_fastapi = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "create_app":
+            create_app_returns_fastapi = _function_returns_fastapi(node)
+            break
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "app" for target in node.targets):
+            continue
+        if _call_is_fastapi(node.value):
+            return True
+        if (
+            isinstance(node.value, ast.Call)
+            and _call_name(node.value.func) == "create_app"
+            and create_app_returns_fastapi
+        ):
+            return True
+    return False
+
+
+def _route_literal_matches(node: ast.Call, route_path: str) -> bool:
+    literal_args = [
+        arg.value
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+    ]
+    if route_path in literal_args:
+        return True
+    for keyword in node.keywords:
+        if keyword.arg == "path" and isinstance(keyword.value, ast.Constant) and keyword.value.value == route_path:
+            return True
+    return False
+
+
+def _route_decorator_matches(decorator: ast.AST, route_path: str) -> bool:
+    if not isinstance(decorator, ast.Call):
+        return False
+    if not isinstance(decorator.func, ast.Attribute):
+        return False
+    if not isinstance(decorator.func.value, ast.Name) or decorator.func.value.id != "app":
+        return False
+    if decorator.func.attr not in {"get", "post", "put", "patch", "delete", "route", "api_route"}:
+        return False
+    return _route_literal_matches(decorator, route_path)
+
+
+def _find_route_handlers(
+    tree: ast.AST,
+    route_path: str,
+) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    handlers: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(_route_decorator_matches(decorator, route_path) for decorator in node.decorator_list):
+            handlers.append(node)
+    return handlers
+
+
+def _base_model_subclass_names(tree: ast.AST) -> set[str]:
+    subclass_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            if isinstance(base, ast.Name) and base.id == "BaseModel":
+                subclass_names.add(node.name)
+            elif isinstance(base, ast.Attribute) and base.attr == "BaseModel":
+                subclass_names.add(node.name)
+    return subclass_names
+
+
+def _annotation_names(node: ast.AST | None) -> set[str]:
+    if node is None:
+        return set()
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Subscript):
+        names = _annotation_names(node.value)
+        slice_node = node.slice
+        if isinstance(slice_node, ast.Tuple):
+            for elt in slice_node.elts:
+                names.update(_annotation_names(elt))
+        else:
+            names.update(_annotation_names(slice_node))
+        return names
+    if isinstance(node, ast.Tuple):
+        names: set[str] = set()
+        for elt in node.elts:
+            names.update(_annotation_names(elt))
+        return names
+    return set()
+
+
+def _predict_uses_pydantic_contract(
+    predict_handlers: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    base_model_names: set[str],
+) -> bool:
+    if not base_model_names:
+        return False
+    for handler in predict_handlers:
+        positional_args = list(handler.args.posonlyargs) + list(handler.args.args)
+        for arg in positional_args + list(handler.args.kwonlyargs):
+            names = _annotation_names(arg.annotation)
+            if names & base_model_names:
+                return True
+    return False
+
+
+def _infer_import_signals(tree: ast.AST) -> tuple[set[str], set[str]]:
+    infer_function_names: set[str] = set()
+    infer_module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module_name = (node.module or "").lower()
+            if "infer" not in module_name and "inference" not in module_name:
+                continue
+            for alias in node.names:
+                if alias.name != "*":
+                    infer_function_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module_name = alias.name.lower()
+                if "infer" in module_name or "inference" in module_name:
+                    infer_module_aliases.add(alias.asname or alias.name.split(".")[-1])
+    return infer_function_names, infer_module_aliases
+
+
+def _predict_calls_inference_logic(
+    predict_handlers: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    infer_function_names: set[str],
+    infer_module_aliases: set[str],
+) -> bool:
+    for handler in predict_handlers:
+        for node in ast.walk(handler):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id in infer_function_names.union({"run_inference"}):
+                return True
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in infer_module_aliases
+            ):
+                return True
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"predict", "predict_proba"}:
+                return True
+    return False
+
+
+def _api_serving_signal_files(repo_dir: Path) -> list[Path]:
+    candidates = [
+        repo_dir / "Dockerfile",
+        repo_dir / "render.yaml",
+        repo_dir / "render.yml",
+        repo_dir / "Procfile",
+        repo_dir / "src" / "main.py",
+        repo_dir / "main.py",
+    ]
+    return [path for path in candidates if path.exists()]
+
+
+def _uvicorn_serving_present(repo_dir: Path) -> bool:
+    patterns = [
+        r"\buvicorn\s+(?:src\.api:app|api:app)\b",
+        r"\bgunicorn\b[\s\S]{0,200}\buvicorn\.workers\.[\w]+worker\b[\s\S]{0,200}\b(?:src\.api:app|api:app)\b",
+    ]
+    for path in _api_serving_signal_files(repo_dir):
+        if path.suffix == ".py":
+            try:
+                tree = ast.parse(read_text(path))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "uvicorn"
+                    and node.func.attr == "run"
+                ):
+                    return True
+            continue
+
+        stripped = _strip_non_code_comments(read_text(path))
+        if any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in patterns):
+            return True
+    return False
+
+
+def scan_api_serving(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "api_fastapi_app_present": 0,
+        "api_pydantic_contract_present": 0,
+        "api_health_endpoint_present": 0,
+        "api_predict_endpoint_present": 0,
+        "api_uvicorn_serving_present": 0,
+        "api_predict_calls_inference_logic": 0,
+        "api_serving_cap_reason": "",
+    }
+
+    api_path, tree = _load_api_module(repo_dir)
+    if api_path is None or tree is None:
+        evidence["api_uvicorn_serving_present"] = int(_uvicorn_serving_present(repo_dir))
+        evidence["api_serving_cap_reason"] = "no_fastapi_app"
+        return evidence
+
+    evidence["api_fastapi_app_present"] = int(_fastapi_app_present(tree))
+    health_handlers = _find_route_handlers(tree, "/health")
+    predict_handlers = _find_route_handlers(tree, "/predict")
+    evidence["api_health_endpoint_present"] = int(bool(health_handlers))
+    evidence["api_predict_endpoint_present"] = int(bool(predict_handlers))
+
+    base_model_names = _base_model_subclass_names(tree)
+    evidence["api_pydantic_contract_present"] = int(
+        _predict_uses_pydantic_contract(predict_handlers, base_model_names)
+    )
+
+    infer_function_names, infer_module_aliases = _infer_import_signals(tree)
+    evidence["api_predict_calls_inference_logic"] = int(
+        _predict_calls_inference_logic(
+            predict_handlers,
+            infer_function_names,
+            infer_module_aliases,
+        )
+    )
+    evidence["api_uvicorn_serving_present"] = int(_uvicorn_serving_present(repo_dir))
+
+    if not evidence["api_fastapi_app_present"]:
+        evidence["api_serving_cap_reason"] = "no_fastapi_app"
+    elif not evidence["api_predict_endpoint_present"]:
+        evidence["api_serving_cap_reason"] = "missing_predict_endpoint"
+    elif not evidence["api_predict_calls_inference_logic"]:
+        evidence["api_serving_cap_reason"] = "predict_without_inference_logic"
+
+    return evidence
+
+
 def _production_signal_files(repo_dir: Path) -> list[Path]:
     candidates = [
         repo_dir / "Dockerfile",
@@ -3045,6 +3350,9 @@ def collect_evidence(
     if _is_selected(selected_dimensions, "model_registry"):
         evidence.update(scan_model_registry(repo_dir))
 
+    if _is_selected(selected_dimensions, "api_serving"):
+        evidence.update(scan_api_serving(repo_dir))
+
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
         evidence.update(run_pylint(repo_dir))
@@ -3375,6 +3683,35 @@ def compute_proxy_scores(
 
         evidence["reg_model_registry_cap_reason"] = "|".join(reasons)
         scores[DIMENSION_TO_SCORE_COLUMN["model_registry"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "api_serving"):
+        section = cfg_get(config, "scoring.api_serving", {})
+
+        score = 0.0
+        signal_names = [
+            "api_fastapi_app_present",
+            "api_pydantic_contract_present",
+            "api_health_endpoint_present",
+            "api_predict_endpoint_present",
+            "api_uvicorn_serving_present",
+        ]
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        if not int(evidence.get("api_fastapi_app_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "no_fastapi_app_cap", 0.0)))
+            evidence["api_serving_cap_reason"] = "no_fastapi_app"
+        elif not int(evidence.get("api_predict_endpoint_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_predict_endpoint_cap", 5.0)))
+            evidence["api_serving_cap_reason"] = "missing_predict_endpoint"
+        elif not int(evidence.get("api_predict_calls_inference_logic", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "predict_without_inference_logic_cap", 7.0)))
+            evidence["api_serving_cap_reason"] = "predict_without_inference_logic"
+        else:
+            evidence["api_serving_cap_reason"] = ""
+
+        scores[DIMENSION_TO_SCORE_COLUMN["api_serving"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "error_handling"):
         section = cfg_get(config, "scoring.error_handling", {})
@@ -3790,6 +4127,33 @@ def make_dimension_comments(
             )
     else:
         comments["model_registry_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "api_serving"):
+        fastapi_app_present = int(evidence.get("api_fastapi_app_present", 0) or 0)
+        pydantic_contract_present = int(evidence.get("api_pydantic_contract_present", 0) or 0)
+        health_endpoint_present = int(evidence.get("api_health_endpoint_present", 0) or 0)
+        predict_endpoint_present = int(evidence.get("api_predict_endpoint_present", 0) or 0)
+        uvicorn_serving_present = int(evidence.get("api_uvicorn_serving_present", 0) or 0)
+        predict_calls_inference_logic = int(evidence.get("api_predict_calls_inference_logic", 0) or 0)
+
+        if not fastapi_app_present:
+            comments["api_serving_comment"] = "No real FastAPI serving layer is clearly evidenced"
+        elif not predict_endpoint_present:
+            comments["api_serving_comment"] = "FastAPI app exists, but /predict is missing"
+        elif not predict_calls_inference_logic:
+            comments["api_serving_comment"] = "Predict endpoint exists, but inference logic is not clearly wired"
+        elif not pydantic_contract_present:
+            comments["api_serving_comment"] = "API endpoints exist, but the Pydantic contract is not clearly enforced"
+        elif not uvicorn_serving_present:
+            comments["api_serving_comment"] = "Uvicorn serving is not clearly evidenced"
+        elif health_endpoint_present and predict_endpoint_present:
+            comments["api_serving_comment"] = (
+                "FastAPI serves /health and /predict with a clear Pydantic request contract"
+            )
+        else:
+            comments["api_serving_comment"] = "FastAPI app exists, but /health is missing"
+    else:
+        comments["api_serving_comment"] = skipped()
 
     if _is_selected(selected_dimensions, "error_handling"):
         function_present = int(evidence.get("validation_function_present", 0) or 0)

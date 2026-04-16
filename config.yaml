@@ -110,6 +110,16 @@ scoring:
     local_fallback_cap: 7.0
     local_only_cap: 0.0
 
+  api_serving:
+    api_fastapi_app_present: 2.5
+    api_pydantic_contract_present: 2.0
+    api_health_endpoint_present: 1.5
+    api_predict_endpoint_present: 2.5
+    api_uvicorn_serving_present: 1.5
+    no_fastapi_app_cap: 0.0
+    missing_predict_endpoint_cap: 5.0
+    predict_without_inference_logic_cap: 7.0
+
   error_handling:
     validation_function_present: 1.0
     validation_raise_present: 1.0
