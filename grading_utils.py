@@ -2240,6 +2240,58 @@ def _base_model_subclass_names(tree: ast.AST) -> set[str]:
     return subclass_names
 
 
+def _module_reference_to_local_path(repo_dir: Path, api_path: Path, module_name: str, level: int = 0) -> Path | None:
+    module = module_name.strip()
+    if level:
+        relative_parts = list(api_path.relative_to(repo_dir).parts[:-1])
+        if level <= len(relative_parts):
+            base_parts = relative_parts[: len(relative_parts) - level + 1]
+        else:
+            base_parts = []
+        if module:
+            parts = base_parts + module.split(".")
+        else:
+            parts = base_parts
+    else:
+        if not module:
+            return None
+        parts = module.split(".")
+
+    candidate = repo_dir.joinpath(*parts).with_suffix(".py")
+    if candidate.exists():
+        return candidate
+
+    package_init = repo_dir.joinpath(*parts, "__init__.py")
+    if package_init.exists():
+        return package_init
+    return None
+
+
+def _local_imported_base_model_names(repo_dir: Path, api_path: Path, tree: ast.AST) -> set[str]:
+    imported_model_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module_path = _module_reference_to_local_path(repo_dir, api_path, node.module or "", node.level)
+        if module_path is None or module_path == api_path:
+            continue
+        try:
+            imported_tree = ast.parse(read_text(module_path))
+        except SyntaxError:
+            continue
+        available_base_models = _base_model_subclass_names(imported_tree)
+        if not available_base_models:
+            continue
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            exported_name = alias.name
+            local_name = alias.asname or alias.name
+            if exported_name in available_base_models:
+                imported_model_names.add(local_name)
+    return imported_model_names
+
+
 def _annotation_names(node: ast.AST | None) -> set[str]:
     if node is None:
         return set()
@@ -2335,6 +2387,8 @@ def _api_serving_signal_files(repo_dir: Path) -> list[Path]:
 def _uvicorn_serving_present(repo_dir: Path) -> bool:
     patterns = [
         r"\buvicorn\s+(?:src\.api:app|api:app)\b",
+        r"[\[\(\{,\s\"']uvicorn[\"']\s*[, \]]+[\s\S]{0,200}[\"'](?:src\.api:app|api:app)[\"']",
+        r"\bconda\s+run\b[\s\S]{0,200}\buvicorn\b[\s\S]{0,200}\b(?:src\.api:app|api:app)\b",
         r"\bgunicorn\b[\s\S]{0,200}\buvicorn\.workers\.[\w]+worker\b[\s\S]{0,200}\b(?:src\.api:app|api:app)\b",
     ]
     for path in _api_serving_signal_files(repo_dir):
@@ -2384,6 +2438,7 @@ def scan_api_serving(repo_dir: Path) -> dict[str, Any]:
     evidence["api_predict_endpoint_present"] = int(bool(predict_handlers))
 
     base_model_names = _base_model_subclass_names(tree)
+    base_model_names.update(_local_imported_base_model_names(repo_dir, api_path, tree))
     evidence["api_pydantic_contract_present"] = int(
         _predict_uses_pydantic_contract(predict_handlers, base_model_names)
     )
