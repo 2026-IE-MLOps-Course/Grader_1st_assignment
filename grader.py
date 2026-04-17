@@ -49,6 +49,10 @@ DIMENSION_CHOICES = [
     "experiment_tracking",
     "model_registry",
     "api_serving",
+    "containerization",
+    "ci_cd",
+    "monitoring",
+    "deployment",
 ]
 
 ALL_DIMENSIONS = [d for d in DIMENSION_CHOICES if d != "all"]
@@ -88,6 +92,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", default="config.yaml",
                         help="Path to grader scoring config YAML")
+    parser.add_argument(
+        "--deployment-urls-file",
+        default="deployment_urls.csv",
+        help="CSV mapping repo_id to public deployment URLs",
+    )
     parser.add_argument(
         "--local-repo-path",
         default=None,
@@ -172,6 +181,7 @@ def grade_single_repo(
         cutoff_str=effective_cutoff,
         timezone_name=effective_timezone,
         selected_dimensions=selected_dimensions,
+        deployment_urls_file=Path(args.deployment_urls_file),
     )
     evidence.update(metadata)
     evidence.update(
@@ -335,6 +345,7 @@ def main() -> None:
                     cutoff_str=args.cutoff,
                     timezone_name=args.timezone,
                     selected_dimensions=selected_dimensions,
+                    deployment_urls_file=Path(args.deployment_urls_file),
                 )
                 evidence.update(metadata)
                 evidence.update(

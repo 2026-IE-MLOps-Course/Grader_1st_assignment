@@ -120,6 +120,35 @@ scoring:
     missing_predict_endpoint_cap: 5.0
     predict_without_inference_logic_cap: 7.0
 
+  containerization:
+    dockerfile_present: 2.0
+    docker_serving_entrypoint_present: 3.0
+    dockerignore_present: 1.0
+    dockerignore_quality_signal: 2.5
+    docker_reproducible_install_signal: 1.5
+    no_dockerfile_cap: 0.0
+    non_serving_docker_entrypoint_cap: 5.0
+    missing_dockerignore_cap: 6.0
+
+  ci_cd:
+    ci_workflow_present: 2.5
+    ci_triggers_on_pr: 3.5
+    ci_runs_validation_steps: 4.0
+    missing_pr_trigger_cap: 5.0
+
+  monitoring:
+    monitoring_local_runtime_log_signal: 2.5
+    monitoring_api_request_trace_signal: 2.5
+    monitoring_api_logging_signal: 2.0
+    monitoring_wandb_inference_telemetry_signal: 2.0
+    monitoring_healthcheck_signal: 1.0
+
+  deployment:
+    deployment_public_url_present: 1.0
+    deployment_service_reachable: 2.0
+    deployment_predict_accepts_valid_json: 3.5
+    deployment_valid_prediction_response: 3.5
+
   error_handling:
     validation_function_present: 1.0
     validation_raise_present: 1.0
