@@ -194,6 +194,9 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "deployment_service_reachable",
         "deployment_predict_accepts_valid_json",
         "deployment_valid_prediction_response",
+        "deployment_repo_id_used",
+        "deployment_url_file_used",
+        "deployment_url_match_mode",
         "deployment_base_url",
         "deployment_predict_url",
         "deployment_health_url",
@@ -3143,13 +3146,22 @@ def normalize_deployment_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path.rstrip("/"), "", ""))
 
 
-def load_deployment_urls(deployment_urls_file: Path | None) -> dict[str, str]:
-    if deployment_urls_file is None or not deployment_urls_file.exists():
-        return {}
+def resolve_deployment_urls_file(deployment_urls_file: str | Path | None) -> Path:
+    if deployment_urls_file is None:
+        return (Path.cwd() / "deployment_urls.csv").resolve()
+    return Path(deployment_urls_file).expanduser().resolve()
 
-    url_map: dict[str, str] = {}
+
+def load_deployment_urls(
+    deployment_urls_file: str | Path | None,
+) -> tuple[list[dict[str, str]], str]:
+    resolved_path = resolve_deployment_urls_file(deployment_urls_file)
+    if not resolved_path.exists():
+        return [], resolved_path.as_posix()
+
+    loaded_rows: list[dict[str, str]] = []
     try:
-        with deployment_urls_file.open("r", encoding="utf-8", newline="") as handle:
+        with resolved_path.open("r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
                 if not isinstance(row, dict):
@@ -3159,11 +3171,45 @@ def load_deployment_urls(deployment_urls_file: Path | None) -> dict[str, str]:
                     continue
                 normalized_url = normalize_deployment_url(str(row.get("render_url", "")).strip())
                 if normalized_url:
-                    url_map[repo_id] = normalized_url
+                    loaded_rows.append(
+                        {
+                            "repo_id": repo_id,
+                            "render_url": normalized_url,
+                        }
+                    )
     except OSError:
-        return {}
+        return [], resolved_path.as_posix()
 
-    return url_map
+    return loaded_rows, resolved_path.as_posix()
+
+
+def _deployment_duplicate_legacy_repo_id(repo_id: str) -> str:
+    return f"{repo_id}_{repo_id}"
+
+
+def match_deployment_url(
+    repo_id: str,
+    deployment_url_rows: list[dict[str, str]],
+) -> tuple[str, str]:
+    stripped_repo_id = repo_id.strip()
+
+    for row in deployment_url_rows:
+        csv_repo_id = row["repo_id"]
+        if csv_repo_id == repo_id:
+            return row["render_url"], "exact"
+
+    for row in deployment_url_rows:
+        csv_repo_id = row["repo_id"]
+        if csv_repo_id.strip() == stripped_repo_id:
+            return row["render_url"], "stripped_exact"
+
+    duplicate_legacy_repo_id = _deployment_duplicate_legacy_repo_id(stripped_repo_id)
+    for row in deployment_url_rows:
+        csv_repo_id = row["repo_id"].strip()
+        if csv_repo_id == duplicate_legacy_repo_id:
+            return row["render_url"], "duplicate_legacy"
+
+    return "", "missing"
 
 
 def _deployment_api_path(repo_dir: Path) -> Path | None:
@@ -3503,13 +3549,16 @@ def _deployment_response_has_valid_prediction(response_json: Any) -> bool:
 def scan_deployment(
     repo_dir: Path,
     repo: RepoSpec,
-    deployment_urls_file: Path | None = None,
+    deployment_urls_file: str | Path | None = None,
 ) -> dict[str, Any]:
     evidence = {
         "deployment_public_url_present": 0,
         "deployment_service_reachable": 0,
         "deployment_predict_accepts_valid_json": 0,
         "deployment_valid_prediction_response": 0,
+        "deployment_repo_id_used": repo.repo_id,
+        "deployment_url_file_used": "",
+        "deployment_url_match_mode": "missing",
         "deployment_base_url": "",
         "deployment_predict_url": "",
         "deployment_health_url": "",
@@ -3524,8 +3573,11 @@ def scan_deployment(
         "deployment_checked_at_utc": "",
     }
 
-    url_map = load_deployment_urls(deployment_urls_file)
-    base_url = normalize_deployment_url(url_map.get(repo.repo_id, ""))
+    deployment_url_rows, resolved_url_file = load_deployment_urls(deployment_urls_file)
+    evidence["deployment_url_file_used"] = resolved_url_file
+    matched_url, match_mode = match_deployment_url(repo.repo_id, deployment_url_rows)
+    evidence["deployment_url_match_mode"] = match_mode
+    base_url = normalize_deployment_url(matched_url)
     if not base_url:
         return evidence
 
@@ -4502,7 +4554,7 @@ def collect_evidence(
     cutoff_str: str,
     timezone_name: str,
     selected_dimensions: set[str],
-    deployment_urls_file: Path | None = None,
+    deployment_urls_file: str | Path | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {}
 

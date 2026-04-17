@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from html import parser
 import os
 import traceback
 from pathlib import Path
@@ -20,6 +19,7 @@ from grading_utils import (
     git_commit_metadata,
     make_dimension_comments,
     parse_repos_file,
+    resolve_deployment_urls_file,
     slim_evidence_for_selected_dimensions,
     resolve_cutoff_commit,
     round2,
@@ -62,6 +62,32 @@ def documentation_score_is_qualitative_only(config: dict[str, Any]) -> bool:
     return bool(config.get("scoring", {}).get("documentation", {}).get("qualitative_only", True))
 
 
+def normalize_local_repo_id(repo_dir: Path) -> str:
+    repo_id = repo_dir.name
+    parent_parts = repo_dir.parent.parts
+    if len(parent_parts) < 2 or parent_parts[-2:] != ("grading_workspace", "clones"):
+        return repo_id
+
+    parts = repo_id.split("_")
+    if len(parts) < 3:
+        return repo_id
+
+    for split_index in range(1, len(parts)):
+        left = parts[:split_index]
+        right = parts[split_index:]
+        if left and left == right:
+            return "_".join(left)
+
+    if len(parts) >= 5:
+        for split_index in range(2, len(parts) - 1):
+            left = parts[:split_index]
+            right = parts[split_index:]
+            if left[1:] == right:
+                return "_".join(left)
+
+    return repo_id
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Grade public student repos for the 1st MLOps assignment")
@@ -94,7 +120,7 @@ def parse_args() -> argparse.Namespace:
                         help="Path to grader scoring config YAML")
     parser.add_argument(
         "--deployment-urls-file",
-        default="deployment_urls.csv",
+        default=None,
         help="CSV mapping repo_id to public deployment URLs",
     )
     parser.add_argument(
@@ -140,7 +166,7 @@ def prepare_local_repo_spec(local_repo_path: str) -> tuple[RepoSpec, Path]:
         raise SystemExit(
             f"Local repo path does not exist or is not a directory: {repo_dir}")
 
-    repo_id = repo_dir.name
+    repo_id = normalize_local_repo_id(repo_dir)
     repo = RepoSpec(
         repo_id=repo_id,
         repo_url=f"local://{repo_id}",
@@ -165,6 +191,7 @@ def grade_single_repo(
     clones_dir: Path,
     selected_dimensions: set[str],
     config: dict[str, Any],
+    deployment_urls_file: Path,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     repo_dir = ensure_clone(repo, clones_dir)
     effective_cutoff = args.cutoff
@@ -181,7 +208,7 @@ def grade_single_repo(
         cutoff_str=effective_cutoff,
         timezone_name=effective_timezone,
         selected_dimensions=selected_dimensions,
-        deployment_urls_file=Path(args.deployment_urls_file),
+        deployment_urls_file=deployment_urls_file,
     )
     evidence.update(metadata)
     evidence.update(
@@ -307,6 +334,7 @@ def main() -> None:
 
     args.cutoff = effective_cutoff
     args.timezone = effective_timezone
+    deployment_urls_file = resolve_deployment_urls_file(args.deployment_urls_file)
 
     clones_dir = Path(args.workdir) / "clones"
     output_dir = Path(args.output_dir)
@@ -345,7 +373,7 @@ def main() -> None:
                     cutoff_str=args.cutoff,
                     timezone_name=args.timezone,
                     selected_dimensions=selected_dimensions,
-                    deployment_urls_file=Path(args.deployment_urls_file),
+                    deployment_urls_file=deployment_urls_file,
                 )
                 evidence.update(metadata)
                 evidence.update(
@@ -369,17 +397,9 @@ def main() -> None:
                     evidence=evidence,
                     scores=scores,
                     selected_dimensions=selected_dimensions,
-                    repo_dir=repo_dir,
+                    repo_dir=local_repo_dir,
                 )
 
-                score_row = {
-                    "repo_id": repo.repo_id,
-                    "repo_url": repo.repo_url,
-                    "branch": repo.branch,
-                    "cutoff_commit": commit,
-                    **empty_score_payload(),
-                    **scores,
-                }
                 score_row = {
                     "repo_id": repo.repo_id,
                     "repo_url": repo.repo_url,
@@ -420,6 +440,7 @@ def main() -> None:
                     clones_dir=clones_dir,
                     selected_dimensions=selected_dimensions,
                     config=config,
+                    deployment_urls_file=deployment_urls_file,
                 )
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to grade {repo.repo_id}: {exc}")
