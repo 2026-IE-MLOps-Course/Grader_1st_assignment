@@ -3191,6 +3191,27 @@ def normalize_deployment_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path.rstrip("/"), "", ""))
 
 
+def normalize_github_repo_url(repo_url: str) -> str:
+    raw = canonical_repo_url((repo_url or "").strip())
+    if not raw:
+        return ""
+
+    github_path = ""
+    if raw.startswith("https://github.com/"):
+        github_path = raw.removeprefix("https://github.com/")
+    elif raw.startswith("git@github.com:"):
+        github_path = raw.removeprefix("git@github.com:")
+    else:
+        return ""
+    github_path = github_path.strip("/")
+    parts = github_path.split("/")
+    if len(parts) != 2 or not all(parts):
+        return ""
+
+    owner, repo = parts
+    return f"https://github.com/{owner}/{repo}"
+
+
 def resolve_deployment_urls_file(deployment_urls_file: str | Path | None) -> Path:
     if deployment_urls_file is None:
         return (Path.cwd() / "deployment_urls.csv").resolve()
@@ -3212,13 +3233,15 @@ def load_deployment_urls(
                 if not isinstance(row, dict):
                     continue
                 repo_id = str(row.get("repo_id", "")).strip()
-                if not repo_id:
-                    continue
+                normalized_repo_url = normalize_github_repo_url(
+                    str(row.get("repo_url", "")).strip()
+                )
                 normalized_url = normalize_deployment_url(str(row.get("render_url", "")).strip())
-                if normalized_url:
+                if normalized_url and (repo_id or normalized_repo_url):
                     loaded_rows.append(
                         {
                             "repo_id": repo_id,
+                            "repo_url": normalized_repo_url,
                             "render_url": normalized_url,
                         }
                     )
@@ -3234,9 +3257,11 @@ def _deployment_duplicate_legacy_repo_id(repo_id: str) -> str:
 
 def match_deployment_url(
     repo_id: str,
+    repo_url: str,
     deployment_url_rows: list[dict[str, str]],
 ) -> tuple[str, str]:
     stripped_repo_id = repo_id.strip()
+    normalized_repo_url = normalize_github_repo_url(repo_url)
 
     for row in deployment_url_rows:
         csv_repo_id = row["repo_id"]
@@ -3253,6 +3278,12 @@ def match_deployment_url(
         csv_repo_id = row["repo_id"].strip()
         if csv_repo_id == duplicate_legacy_repo_id:
             return row["render_url"], "duplicate_legacy"
+
+    if normalized_repo_url:
+        for row in deployment_url_rows:
+            csv_repo_url = row.get("repo_url", "")
+            if csv_repo_url == normalized_repo_url:
+                return row["render_url"], "repo_url_exact"
 
     return "", "missing"
 
@@ -4356,7 +4387,11 @@ def scan_deployment(
 
     deployment_url_rows, resolved_url_file = load_deployment_urls(deployment_urls_file)
     evidence["deployment_url_file_used"] = resolved_url_file
-    matched_url, match_mode = match_deployment_url(repo.repo_id, deployment_url_rows)
+    matched_url, match_mode = match_deployment_url(
+        repo.repo_id,
+        repo.repo_url,
+        deployment_url_rows,
+    )
     evidence["deployment_url_match_mode"] = match_mode
     base_url = normalize_deployment_url(matched_url)
     if not base_url:

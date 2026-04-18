@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import traceback
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,65 @@ DIMENSION_CHOICES = [
 
 ALL_DIMENSIONS = [d for d in DIMENSION_CHOICES if d != "all"]
 
+DIMENSION_GROUP_CHOICES = [
+    "first_assignment",
+    "final_assignment",
+    "all",
+]
+
+DIMENSION_GROUPS = {
+    "first_assignment": [
+        "modularization",
+        "code_quality",
+        "documentation",
+        "testing",
+        "dependencies",
+        "error_handling",
+        "artifacting",
+        "pipeline",
+        "version_control",
+    ],
+    "final_assignment": [
+        "config_reproducibility",
+        "security_secrets",
+        "logging_observability",
+        "experiment_tracking",
+        "model_registry",
+        "api_serving",
+        "containerization",
+        "ci_cd",
+        "monitoring",
+        "deployment",
+        "github_workflow_discipline",
+        "release_discipline",
+    ],
+    "all": ALL_DIMENSIONS,
+}
+
+
+class TrackExplicitDimensions(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: list[str],
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "dimensions_explicit", True)
+
+
+class TrackExplicitReposFile(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "repos_file_explicit", True)
+
 
 def documentation_score_is_qualitative_only(config: dict[str, Any]) -> bool:
     return bool(config.get("scoring", {}).get("documentation", {}).get("qualitative_only", True))
@@ -90,10 +150,48 @@ def normalize_local_repo_id(repo_dir: Path) -> str:
     return repo_id
 
 
+def normalize_github_repo_url(remote_url: str) -> str | None:
+    remote = remote_url.strip()
+    if not remote:
+        return None
+
+    for prefix in ("https://github.com/", "git@github.com:"):
+        if remote.startswith(prefix):
+            repo_path = remote.removeprefix(prefix)
+            if repo_path.endswith(".git"):
+                repo_path = repo_path[:-4]
+            repo_path = repo_path.strip("/")
+            parts = repo_path.split("/")
+            if len(parts) == 2 and all(parts):
+                owner, repo = parts
+                return f"https://github.com/{owner}/{repo}"
+            return None
+
+    return None
+
+
+def resolve_local_github_repo_url(repo_dir: Path) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    return normalize_github_repo_url(result.stdout)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Grade public student repos for the 1st MLOps assignment")
+    parser.set_defaults(dimensions_explicit=False)
+    parser.set_defaults(repos_file_explicit=False)
     parser.add_argument("--repos-file", default="repos.txt",
+                        action=TrackExplicitReposFile,
                         help="Path to repos.txt")
     parser.add_argument("--workdir", default="grading_workspace",
                         help="Working directory for cloned repos")
@@ -116,7 +214,14 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["all"],
         choices=DIMENSION_CHOICES,
+        action=TrackExplicitDimensions,
         help="Run all checks or only selected rubric dimensions",
+    )
+    parser.add_argument(
+        "--dimension-group",
+        default=None,
+        choices=DIMENSION_GROUP_CHOICES,
+        help="Run a convenience group of rubric dimensions",
     )
     parser.add_argument("--config", default="config.yaml",
                         help="Path to grader scoring config YAML")
@@ -147,6 +252,45 @@ def normalize_dimensions(raw_dimensions: list[str]) -> set[str]:
     return set(raw_dimensions)
 
 
+def resolve_selected_dimensions(args: argparse.Namespace) -> set[str]:
+    if args.dimensions_explicit:
+        return normalize_dimensions(args.dimensions)
+    if args.dimension_group:
+        return normalize_dimensions(DIMENSION_GROUPS[args.dimension_group])
+    return normalize_dimensions(args.dimensions)
+
+
+def resolve_effective_deployment_urls_file(
+    explicit_deployment_urls_file: str | None,
+    config_deployment_urls_file: str | None,
+    config_path: Path,
+) -> Path:
+    if explicit_deployment_urls_file is not None:
+        return resolve_deployment_urls_file(explicit_deployment_urls_file)
+
+    if config_deployment_urls_file:
+        return resolve_deployment_urls_file(
+            config_path.parent / config_deployment_urls_file
+        )
+
+    return resolve_deployment_urls_file(None)
+
+
+def resolve_effective_repos_file(
+    explicit_repos_file: str,
+    repos_file_explicit: bool,
+    config_repos_file: str | None,
+    config_path: Path,
+) -> Path:
+    if repos_file_explicit:
+        return Path(explicit_repos_file)
+
+    if config_repos_file:
+        return (config_path.parent / config_repos_file).resolve()
+
+    return Path(explicit_repos_file)
+
+
 def prepare_repo_specs(args: argparse.Namespace) -> list[RepoSpec]:
     repo_specs = parse_repos_file(Path(args.repos_file))
     if args.include_benchmark:
@@ -169,9 +313,10 @@ def prepare_local_repo_spec(local_repo_path: str) -> tuple[RepoSpec, Path]:
             f"Local repo path does not exist or is not a directory: {repo_dir}")
 
     repo_id = normalize_local_repo_id(repo_dir)
+    repo_url = resolve_local_github_repo_url(repo_dir) or f"local://{repo_id}"
     repo = RepoSpec(
         repo_id=repo_id,
-        repo_url=f"local://{repo_id}",
+        repo_url=repo_url,
         branch="main",
         fixed_commit=None,
         is_benchmark=False,
@@ -317,11 +462,14 @@ def error_rows(
 def main() -> None:
     # validate_runtime_requirements()
     args = parse_args()
-    selected_dimensions = normalize_dimensions(args.dimensions)
-    config = load_grading_config(Path(args.config))
+    selected_dimensions = resolve_selected_dimensions(args)
+    config_path = Path(args.config).resolve()
+    config = load_grading_config(config_path)
 
     submission_cfg = config.get(
         "submission", {}) if isinstance(config, dict) else {}
+    repos_file_cfg = submission_cfg.get("repos_file")
+    deployment_urls_file_cfg = submission_cfg.get("deployment_urls_file")
 
     effective_cutoff = args.cutoff or submission_cfg.get("cutoff_datetime")
     effective_timezone = args.timezone or submission_cfg.get("timezone")
@@ -336,7 +484,17 @@ def main() -> None:
 
     args.cutoff = effective_cutoff
     args.timezone = effective_timezone
-    deployment_urls_file = resolve_deployment_urls_file(args.deployment_urls_file)
+    args.repos_file = str(resolve_effective_repos_file(
+        args.repos_file,
+        args.repos_file_explicit,
+        repos_file_cfg,
+        config_path,
+    ))
+    deployment_urls_file = resolve_effective_deployment_urls_file(
+        args.deployment_urls_file,
+        deployment_urls_file_cfg,
+        config_path,
+    )
 
     clones_dir = Path(args.workdir) / "clones"
     output_dir = Path(args.output_dir)

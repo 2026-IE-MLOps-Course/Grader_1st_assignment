@@ -1,6 +1,8 @@
 submission:
   cutoff_datetime: "2026-03-27 23:59:59"
   timezone: "Europe/Madrid"
+  repos_file: repos.txt
+  deployment_urls_file: deployment_urls.csv
 
 scoring:
   modularization:
@@ -145,13 +147,13 @@ scoring:
 
   deployment:
     wrong_docs_example_penalty: 2.0
-  release_discipline:
-    release_found_points: 5.0
-    release_targets_main_points: 5.0
     deployment_public_url_present: 1.0
     deployment_service_reachable: 2.0
     deployment_predict_accepts_valid_json: 3.5
     deployment_valid_prediction_response: 3.5
+  release_discipline:
+    release_found_points: 5.0
+    release_targets_main_points: 5.0
 
   github_workflow_discipline:
     ghwf_pr_to_main_signal: 5.0
