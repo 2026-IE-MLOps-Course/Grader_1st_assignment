@@ -194,6 +194,21 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "deployment_service_reachable",
         "deployment_predict_accepts_valid_json",
         "deployment_valid_prediction_response",
+        "deployment_docs_example_present",
+        "deployment_docs_example_source",
+        "deployment_docs_example_predict_status_code",
+        "deployment_docs_example_valid",
+        "deployment_docs_example_error",
+        "deployment_docs_example_repair_attempted",
+        "deployment_docs_example_repair_applied",
+        "deployment_docs_example_repair_reason",
+        "deployment_missing_field_repair_attempted",
+        "deployment_missing_field_repair_succeeded",
+        "deployment_missing_field_repair_reason",
+        "deployment_missing_field_repaired_status_code",
+        "deployment_fallback_payload_source",
+        "deployment_live_payload_strategy",
+        "deployment_docs_penalty_reason",
         "deployment_repo_id_used",
         "deployment_url_file_used",
         "deployment_url_match_mode",
@@ -3546,6 +3561,691 @@ def _deployment_response_has_valid_prediction(response_json: Any) -> bool:
     return False
 
 
+def _deployment_resolve_openapi_ref(openapi_payload: dict[str, Any], ref: str) -> Any:
+    if not ref.startswith("#/"):
+        return None
+
+    current: Any = openapi_payload
+    for part in ref[2:].split("/"):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
+
+
+def _deployment_openapi_examples_value(examples_payload: Any) -> Any:
+    if not isinstance(examples_payload, dict):
+        return None
+    for example_payload in examples_payload.values():
+        if not isinstance(example_payload, dict):
+            continue
+        if "value" in example_payload:
+            return example_payload.get("value")
+        if "externalValue" in example_payload:
+            continue
+    return None
+
+
+def _deployment_resolve_openapi_schema_example(
+    schema_payload: Any,
+    openapi_payload: dict[str, Any],
+    seen_refs: set[str] | None = None,
+) -> Any:
+    if not isinstance(schema_payload, dict):
+        return None
+
+    if seen_refs is None:
+        seen_refs = set()
+
+    ref = schema_payload.get("$ref")
+    if isinstance(ref, str):
+        if ref in seen_refs:
+            return None
+        seen_refs.add(ref)
+        resolved = _deployment_resolve_openapi_ref(openapi_payload, ref)
+        return _deployment_resolve_openapi_schema_example(resolved, openapi_payload, seen_refs)
+
+    if "example" in schema_payload:
+        return schema_payload.get("example")
+
+    schema_examples = _deployment_openapi_examples_value(schema_payload.get("examples"))
+    if schema_examples is not None:
+        return schema_examples
+
+    properties = schema_payload.get("properties")
+    if isinstance(properties, dict):
+        built_example: dict[str, Any] = {}
+        for property_name, property_schema in properties.items():
+            property_example = _deployment_resolve_openapi_schema_example(
+                property_schema,
+                openapi_payload,
+                seen_refs=set(seen_refs),
+            )
+            if property_example is not None:
+                built_example[property_name] = property_example
+        if built_example:
+            return built_example
+
+    items_schema = schema_payload.get("items")
+    if isinstance(items_schema, dict):
+        item_example = _deployment_resolve_openapi_schema_example(
+            items_schema,
+            openapi_payload,
+            seen_refs=set(seen_refs),
+        )
+        if item_example is not None:
+            return [item_example]
+
+    return None
+
+
+def _deployment_extract_openapi_predict_example(
+    openapi_payload: dict[str, Any],
+) -> tuple[Any, str]:
+    paths_payload = openapi_payload.get("paths")
+    if not isinstance(paths_payload, dict):
+        return None, "no_openapi_example"
+
+    predict_payload = paths_payload.get("/predict")
+    if not isinstance(predict_payload, dict):
+        return None, "no_openapi_example"
+
+    for method in ("post", "put", "patch"):
+        operation_payload = predict_payload.get(method)
+        if not isinstance(operation_payload, dict):
+            continue
+        request_body = operation_payload.get("requestBody")
+        if not isinstance(request_body, dict):
+            continue
+        content_payload = request_body.get("content")
+        if not isinstance(content_payload, dict):
+            continue
+        json_media = content_payload.get("application/json")
+        if not isinstance(json_media, dict):
+            continue
+
+        if "example" in json_media:
+            return json_media.get("example"), "deployment_openapi_example"
+
+        media_examples = _deployment_openapi_examples_value(json_media.get("examples"))
+        if media_examples is not None:
+            return media_examples, "deployment_openapi_example"
+
+        schema_example = _deployment_resolve_openapi_schema_example(
+            json_media.get("schema"),
+            openapi_payload,
+        )
+        if schema_example is not None:
+            return schema_example, "deployment_openapi_example"
+
+    return None, "no_openapi_example"
+
+
+def derive_deployment_openapi_payload(
+    base_url: str,
+) -> tuple[Any, str, str]:
+    openapi_url = f"{base_url}/openapi.json"
+    try:
+        response = requests.get(openapi_url, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return None, "missing", _deployment_text_excerpt(str(exc))
+
+    try:
+        openapi_payload = response.json()
+    except ValueError as exc:
+        return None, "missing", _deployment_text_excerpt(str(exc))
+
+    example_payload, source = _deployment_extract_openapi_predict_example(openapi_payload)
+    if example_payload is None:
+        return None, "missing", source
+
+    if not isinstance(example_payload, (dict, list)):
+        return None, "missing", "openapi_example_unparseable"
+
+    return example_payload, source, ""
+
+
+def probe_deployment_predict_payload(
+    predict_url: str,
+    payload: Any,
+) -> dict[str, Any]:
+    result = {
+        "status_code": "",
+        "valid": 0,
+        "error": "",
+        "response_excerpt": "",
+        "response_json": None,
+    }
+
+    for backoff_seconds in [0, 5, 15]:
+        if backoff_seconds:
+            time.sleep(backoff_seconds)
+        try:
+            response = requests.post(predict_url, json=payload, timeout=20)
+        except requests.Timeout:
+            result["error"] = "Timed out after 20s"
+            continue
+        except requests.RequestException as exc:
+            result["error"] = _deployment_text_excerpt(str(exc))
+            continue
+
+        result["status_code"] = response.status_code
+        result["response_excerpt"] = _deployment_text_excerpt(response.text)
+        if response.status_code != 200:
+            result["error"] = _deployment_text_excerpt(response.text or f"HTTP {response.status_code}")
+            continue
+
+        try:
+            response_json = response.json()
+            result["response_json"] = response_json
+        except ValueError as exc:
+            result["error"] = _deployment_text_excerpt(str(exc))
+            continue
+
+        if _deployment_response_has_valid_prediction(response_json):
+            result["valid"] = 1
+            result["error"] = ""
+            return result
+
+        result["error"] = _deployment_text_excerpt(response_json)
+
+    return result
+
+
+def probe_deployment_predict_payload_once(
+    predict_url: str,
+    payload: Any,
+) -> dict[str, Any]:
+    result = {
+        "status_code": "",
+        "valid": 0,
+        "error": "",
+        "response_excerpt": "",
+        "response_json": None,
+    }
+
+    try:
+        response = requests.post(predict_url, json=payload, timeout=20)
+    except requests.Timeout:
+        result["error"] = "Timed out after 20s"
+        return result
+    except requests.RequestException as exc:
+        result["error"] = _deployment_text_excerpt(str(exc))
+        return result
+
+    result["status_code"] = response.status_code
+    result["response_excerpt"] = _deployment_text_excerpt(response.text)
+    if response.status_code != 200:
+        result["error"] = _deployment_text_excerpt(response.text or f"HTTP {response.status_code}")
+        try:
+            result["response_json"] = response.json()
+        except ValueError:
+            pass
+        return result
+
+    try:
+        response_json = response.json()
+        result["response_json"] = response_json
+    except ValueError as exc:
+        result["error"] = _deployment_text_excerpt(str(exc))
+        return result
+
+    if _deployment_response_has_valid_prediction(response_json):
+        result["valid"] = 1
+        return result
+
+    result["error"] = _deployment_text_excerpt(response_json)
+    return result
+
+
+def _deployment_is_integer_number(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _deployment_parse_numeric_value(raw_value: Any) -> float | None:
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        return float(raw_value)
+    if not isinstance(raw_value, str):
+        return None
+    try:
+        return float(raw_value.strip())
+    except ValueError:
+        return None
+
+
+def _deployment_number_from_constraint(value: float, prefer_integer: bool) -> float | int:
+    if prefer_integer and float(value).is_integer():
+        return int(value)
+    return float(value)
+
+
+def _deployment_repaired_numeric_value(
+    current_value: Any,
+    constraint: dict[str, Any],
+) -> float | int | None:
+    prefer_integer = _deployment_is_integer_number(current_value)
+    constraint_kind = constraint.get("kind")
+
+    if constraint_kind == "minimum":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        return _deployment_number_from_constraint(parsed, prefer_integer)
+
+    if constraint_kind == "maximum":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        return _deployment_number_from_constraint(parsed, prefer_integer)
+
+    if constraint_kind == "gt":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        if prefer_integer:
+            return int(parsed) + 1
+        return float(parsed) + 1.0
+
+    if constraint_kind == "lt":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        if prefer_integer:
+            return int(parsed) - 1
+        return float(parsed) - 1.0
+
+    if constraint_kind == "between":
+        lower = _deployment_parse_numeric_value(constraint.get("lower"))
+        upper = _deployment_parse_numeric_value(constraint.get("upper"))
+        if lower is None or upper is None:
+            return None
+        midpoint = (lower + upper) / 2.0
+        if prefer_integer:
+            midpoint_value = int(round(midpoint))
+            return max(int(lower), min(int(upper), midpoint_value))
+        return max(lower, min(upper, midpoint))
+
+    return None
+
+
+def _deployment_runtime_error_text(error_text: str) -> bool:
+    lowered = error_text.lower()
+    runtime_markers = [
+        "traceback",
+        "attributeerror",
+        "typeerror",
+        "valueerror",
+        "exception",
+        "transform",
+        "predict",
+        "model",
+        "internal server error",
+        "has no attribute",
+    ]
+    return any(marker in lowered for marker in runtime_markers)
+
+
+def _deployment_docs_error_is_runtime_like(docs_probe: dict[str, Any]) -> bool:
+    status_code = str(docs_probe.get("status_code", "")).strip()
+    if status_code and status_code.isdigit() and int(status_code) >= 500:
+        return True
+
+    error_text = str(docs_probe.get("error", "")).strip()
+    excerpt_text = str(docs_probe.get("response_excerpt", "")).strip()
+    if _deployment_runtime_error_text(error_text) or _deployment_runtime_error_text(excerpt_text):
+        return True
+
+    response_json = docs_probe.get("response_json")
+    if isinstance(response_json, dict):
+        detail_payload = response_json.get("detail")
+        if isinstance(detail_payload, str) and _deployment_runtime_error_text(detail_payload):
+            return True
+
+    return False
+
+
+def _deployment_docs_error_is_validation_like(docs_probe: dict[str, Any]) -> bool:
+    status_code = str(docs_probe.get("status_code", "")).strip()
+    if status_code == "422":
+        return True
+
+    response_json = docs_probe.get("response_json")
+    if isinstance(response_json, dict):
+        detail_payload = response_json.get("detail")
+        if isinstance(detail_payload, list):
+            return True
+
+    error_text = str(docs_probe.get("error", "")).lower()
+    return "validation" in error_text or "minimum" in error_text or "between" in error_text
+
+
+def _deployment_constraint_from_text(message_text: str) -> dict[str, Any] | None:
+    between_match = re.search(
+        r"between\s+(-?\d+(?:\.\d+)?)\s+and\s+(-?\d+(?:\.\d+)?)",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if between_match:
+        return {
+            "kind": "between",
+            "lower": float(between_match.group(1)),
+            "upper": float(between_match.group(2)),
+        }
+
+    minimum_match = re.search(
+        r"(?:below\s+minimum|min(?:imum)?|greater than or equal to|ge)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if minimum_match:
+        return {"kind": "minimum", "value": float(minimum_match.group(1))}
+
+    maximum_match = re.search(
+        r"(?:above\s+maximum|max(?:imum)?|less than or equal to|le)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if maximum_match:
+        return {"kind": "maximum", "value": float(maximum_match.group(1))}
+
+    gt_match = re.search(
+        r"(?:greater than|gt)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if gt_match:
+        return {"kind": "gt", "value": float(gt_match.group(1))}
+
+    lt_match = re.search(
+        r"(?:less than|lt)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if lt_match:
+        return {"kind": "lt", "value": float(lt_match.group(1))}
+
+    return None
+
+
+def _deployment_field_from_text(message_text: str) -> str:
+    field_match = re.search(r"[\"'`](?P<field>[A-Za-z0-9_.-]+)[\"'`]", message_text)
+    if field_match:
+        return field_match.group("field")
+    return ""
+
+
+def _deployment_constraint_from_validation_entry(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+
+    entry_type = str(entry.get("type", "")).strip()
+    ctx = entry.get("ctx") if isinstance(entry.get("ctx"), dict) else {}
+    if entry_type in {"greater_than_equal", "ge", "greater_than_equal_validator"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("ge"))
+        if parsed is not None:
+            return {"kind": "minimum", "value": parsed}
+    if entry_type in {"less_than_equal", "le", "less_than_equal_validator"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("le"))
+        if parsed is not None:
+            return {"kind": "maximum", "value": parsed}
+    if entry_type in {"greater_than", "gt"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("gt"))
+        if parsed is not None:
+            return {"kind": "gt", "value": parsed}
+    if entry_type in {"less_than", "lt"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("lt"))
+        if parsed is not None:
+            return {"kind": "lt", "value": parsed}
+
+    message_text = str(entry.get("msg", "")).strip()
+    return _deployment_constraint_from_text(message_text)
+
+
+def _deployment_loc_path_from_validation_entry(entry: Any) -> list[Any]:
+    if not isinstance(entry, dict):
+        return []
+
+    loc = entry.get("loc")
+    if not isinstance(loc, (list, tuple)):
+        return []
+
+    normalized_loc = [part for part in loc if part != "body"]
+    return normalized_loc
+
+
+def _deployment_find_key_paths(payload: Any, target_key: str, current_path: list[Any] | None = None) -> list[list[Any]]:
+    if current_path is None:
+        current_path = []
+
+    found_paths: list[list[Any]] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            next_path = current_path + [key]
+            if key == target_key:
+                found_paths.append(next_path)
+            found_paths.extend(_deployment_find_key_paths(value, target_key, next_path))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            found_paths.extend(_deployment_find_key_paths(value, target_key, current_path + [index]))
+    return found_paths
+
+
+def _deployment_get_nested_value(payload: Any, path: list[Any]) -> Any:
+    current = payload
+    for part in path:
+        if isinstance(current, dict) and isinstance(part, str) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def _deployment_set_nested_value(payload: Any, path: list[Any], value: Any) -> bool:
+    if not path:
+        return False
+
+    current = payload
+    for part in path[:-1]:
+        if isinstance(current, dict) and isinstance(part, str) and part in current:
+            current = current[part]
+            continue
+        if isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            current = current[part]
+            continue
+        return False
+
+    last_part = path[-1]
+    if isinstance(current, dict) and isinstance(last_part, str) and last_part in current:
+        current[last_part] = value
+        return True
+    if isinstance(current, list) and isinstance(last_part, int) and 0 <= last_part < len(current):
+        current[last_part] = value
+        return True
+    return False
+
+
+def _deployment_repair_numeric_docs_example(
+    docs_payload: Any,
+    docs_probe: dict[str, Any],
+) -> tuple[Any, str]:
+    if _deployment_docs_error_is_runtime_like(docs_probe):
+        return None, "non_repairable_runtime_error"
+
+    if not _deployment_docs_error_is_validation_like(docs_probe):
+        return None, "non_repairable_validation_error"
+
+    repaired_payload = json.loads(json.dumps(docs_payload))
+    response_json = docs_probe.get("response_json")
+    repair_actions: list[tuple[list[Any], dict[str, Any], str]] = []
+
+    if isinstance(response_json, dict) and isinstance(response_json.get("detail"), list):
+        for entry in response_json.get("detail", []):
+            constraint = _deployment_constraint_from_validation_entry(entry)
+            if constraint is None:
+                continue
+            loc_path = _deployment_loc_path_from_validation_entry(entry)
+            field_name = _deployment_field_from_text(str(entry.get("msg", "")).strip())
+            repair_actions.append((loc_path, constraint, field_name))
+
+    if not repair_actions:
+        error_text = str(docs_probe.get("error", "")).strip()
+        excerpt_text = str(docs_probe.get("response_excerpt", "")).strip()
+        combined_text = f"{error_text} {excerpt_text}".strip()
+        constraint = _deployment_constraint_from_text(combined_text)
+        field_name = _deployment_field_from_text(combined_text)
+        if constraint is None:
+            return None, "no_numeric_constraint_found"
+        repair_actions.append(([], constraint, field_name))
+
+    applied_any = False
+    for loc_path, constraint, field_name in repair_actions:
+        target_path = list(loc_path)
+        if not target_path and field_name:
+            candidate_paths = _deployment_find_key_paths(repaired_payload, field_name)
+            if len(candidate_paths) == 1:
+                target_path = candidate_paths[0]
+
+        current_value = _deployment_get_nested_value(repaired_payload, target_path) if target_path else None
+        if current_value is None:
+            continue
+        if not isinstance(current_value, (int, float)) or isinstance(current_value, bool):
+            continue
+
+        repaired_value = _deployment_repaired_numeric_value(current_value, constraint)
+        if repaired_value is None:
+            continue
+        if _deployment_set_nested_value(repaired_payload, target_path, repaired_value):
+            applied_any = True
+
+    if not applied_any:
+        return None, "numeric_constraint_not_applied"
+
+    return repaired_payload, "numeric_bounds_repaired"
+
+
+def _deployment_missing_required_entries(response_json: Any) -> list[dict[str, Any]]:
+    if not isinstance(response_json, dict):
+        return []
+    detail_payload = response_json.get("detail")
+    if not isinstance(detail_payload, list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for entry in detail_payload:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type", "")).strip().lower()
+        entry_msg = str(entry.get("msg", "")).strip().lower()
+        if entry_type == "missing" or "field required" in entry_msg or "missing" in entry_msg:
+            entries.append(entry)
+    return entries
+
+
+def _deployment_normalize_alias_tokens(field_name: str) -> list[str]:
+    raw_tokens = [token for token in re.split(r"[^a-zA-Z0-9]+", field_name.lower()) if token]
+    normalized_tokens: list[str] = []
+    for token in raw_tokens:
+        normalized_tokens.append(re.sub(r"(.)\1+", r"\1", token))
+    return normalized_tokens
+
+
+def _deployment_token_subsequence_present(haystack: list[str], needle: list[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    for start_index in range(len(haystack) - len(needle) + 1):
+        if haystack[start_index:start_index + len(needle)] == needle:
+            return True
+    return False
+
+
+def _deployment_find_required_field_alias_key(
+    payload_object: Any,
+    missing_field: str,
+) -> tuple[str, str]:
+    if not isinstance(payload_object, dict):
+        return "", "required_field_alias_not_found"
+
+    missing_tokens = _deployment_normalize_alias_tokens(missing_field)
+    if not missing_tokens:
+        return "", "required_field_alias_not_found"
+
+    strong_candidates: list[str] = []
+    for candidate_key in payload_object.keys():
+        if not isinstance(candidate_key, str) or candidate_key == missing_field:
+            continue
+        candidate_tokens = _deployment_normalize_alias_tokens(candidate_key)
+        if not candidate_tokens:
+            continue
+
+        if candidate_tokens == missing_tokens:
+            strong_candidates.append(candidate_key)
+            continue
+
+        token_count = len(missing_tokens)
+        if candidate_tokens[:token_count] == missing_tokens or candidate_tokens[-token_count:] == missing_tokens:
+            strong_candidates.append(candidate_key)
+            continue
+
+        if _deployment_token_subsequence_present(candidate_tokens, missing_tokens):
+            strong_candidates.append(candidate_key)
+
+    unique_candidates = sorted(set(strong_candidates))
+    if len(unique_candidates) == 1:
+        return unique_candidates[0], "required_field_alias_copy"
+    if len(unique_candidates) > 1:
+        return "", "required_field_alias_not_unique"
+    return "", "required_field_alias_not_found"
+
+
+def _deployment_repair_missing_required_field_aliases(
+    fallback_payload: Any,
+    fallback_probe: dict[str, Any],
+) -> tuple[Any, str, int]:
+    if _deployment_docs_error_is_runtime_like(fallback_probe):
+        return None, "non_repairable_runtime_error", 0
+
+    missing_entries = _deployment_missing_required_entries(fallback_probe.get("response_json"))
+    if not missing_entries:
+        return None, "required_field_alias_not_found", 0
+
+    repaired_payload = json.loads(json.dumps(fallback_payload))
+    applied_any = False
+    saw_ambiguous = False
+
+    for entry in missing_entries:
+        loc_path = _deployment_loc_path_from_validation_entry(entry)
+        if not loc_path:
+            continue
+        object_path = loc_path[:-1]
+        if not object_path:
+            continue
+        missing_field = str(loc_path[-1]).strip()
+        if not missing_field:
+            continue
+
+        target_object = _deployment_get_nested_value(repaired_payload, object_path)
+        alias_key, alias_reason = _deployment_find_required_field_alias_key(target_object, missing_field)
+        if alias_reason == "required_field_alias_not_unique":
+            saw_ambiguous = True
+            continue
+        if not alias_key or not isinstance(target_object, dict) or alias_key not in target_object:
+            continue
+
+        target_object[missing_field] = target_object[alias_key]
+        applied_any = True
+
+    if applied_any:
+        return repaired_payload, "required_field_alias_copy", 1
+    if saw_ambiguous:
+        return None, "required_field_alias_not_unique", 1
+    return None, "required_field_alias_not_found", 1
+
+
 def scan_deployment(
     repo_dir: Path,
     repo: RepoSpec,
@@ -3556,6 +4256,21 @@ def scan_deployment(
         "deployment_service_reachable": 0,
         "deployment_predict_accepts_valid_json": 0,
         "deployment_valid_prediction_response": 0,
+        "deployment_docs_example_present": 0,
+        "deployment_docs_example_source": "missing",
+        "deployment_docs_example_predict_status_code": "",
+        "deployment_docs_example_valid": 0,
+        "deployment_docs_example_error": "",
+        "deployment_docs_example_repair_attempted": 0,
+        "deployment_docs_example_repair_applied": 0,
+        "deployment_docs_example_repair_reason": "",
+        "deployment_missing_field_repair_attempted": 0,
+        "deployment_missing_field_repair_succeeded": 0,
+        "deployment_missing_field_repair_reason": "",
+        "deployment_missing_field_repaired_status_code": "",
+        "deployment_fallback_payload_source": "",
+        "deployment_live_payload_strategy": "",
+        "deployment_docs_penalty_reason": "",
         "deployment_repo_id_used": repo.repo_id,
         "deployment_url_file_used": "",
         "deployment_url_match_mode": "missing",
@@ -3589,10 +4304,79 @@ def scan_deployment(
         datetime.now(ZoneInfo("UTC")).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     )
 
-    payload, payload_source = derive_deployment_payload(repo_dir)
-    if payload is None:
-        payload = {}
-        payload_source = "empty_fallback"
+    docs_payload, docs_payload_source, docs_payload_error = derive_deployment_openapi_payload(base_url)
+    evidence["deployment_docs_example_source"] = docs_payload_source
+    repaired_docs_payload = None
+    if docs_payload is not None:
+        evidence["deployment_docs_example_present"] = 1
+        docs_probe = probe_deployment_predict_payload(evidence["deployment_predict_url"], docs_payload)
+        evidence["deployment_docs_example_predict_status_code"] = docs_probe["status_code"]
+        evidence["deployment_docs_example_valid"] = docs_probe["valid"]
+        evidence["deployment_docs_example_error"] = docs_probe["error"]
+        if docs_probe["valid"] != 1:
+            repaired_docs_payload, repair_reason = _deployment_repair_numeric_docs_example(
+                docs_payload,
+                docs_probe,
+            )
+            evidence["deployment_docs_example_repair_reason"] = repair_reason
+            if repaired_docs_payload is not None:
+                evidence["deployment_docs_example_repair_attempted"] = 1
+                repaired_probe = probe_deployment_predict_payload(
+                    evidence["deployment_predict_url"],
+                    repaired_docs_payload,
+                )
+                if repaired_probe["valid"] == 1:
+                    evidence["deployment_docs_example_repair_applied"] = 1
+    elif docs_payload_error:
+        evidence["deployment_docs_example_error"] = docs_payload_error
+
+    fallback_payload, fallback_payload_source = derive_deployment_payload(repo_dir)
+    if fallback_payload is None:
+        fallback_payload = {}
+        fallback_payload_source = "empty_fallback"
+
+    payload = fallback_payload
+    payload_source = fallback_payload_source
+    evidence["deployment_fallback_payload_source"] = ""
+    if evidence["deployment_docs_example_valid"]:
+        payload = docs_payload
+        payload_source = "deployment_openapi_example"
+    elif evidence["deployment_docs_example_repair_applied"]:
+        payload = repaired_docs_payload
+        payload_source = "deployment_openapi_example_repaired"
+    else:
+        evidence["deployment_fallback_payload_source"] = fallback_payload_source
+        if (
+            fallback_payload_source != "empty_fallback"
+            and (
+                int(evidence["deployment_docs_example_present"]) != 1
+                or int(evidence["deployment_docs_example_valid"]) != 1
+            )
+        ):
+            fallback_probe = probe_deployment_predict_payload_once(
+                evidence["deployment_predict_url"],
+                fallback_payload,
+            )
+            repaired_fallback_payload, repair_reason, repair_attempted = (
+                _deployment_repair_missing_required_field_aliases(
+                    fallback_payload,
+                    fallback_probe,
+                )
+            )
+            evidence["deployment_missing_field_repair_attempted"] = repair_attempted
+            evidence["deployment_missing_field_repair_reason"] = repair_reason
+            if repaired_fallback_payload is not None:
+                repaired_fallback_probe = probe_deployment_predict_payload_once(
+                    evidence["deployment_predict_url"],
+                    repaired_fallback_payload,
+                )
+                evidence["deployment_missing_field_repaired_status_code"] = (
+                    repaired_fallback_probe["status_code"]
+                )
+                if repaired_fallback_probe["valid"] == 1:
+                    evidence["deployment_missing_field_repair_succeeded"] = 1
+                    payload = repaired_fallback_payload
+
     evidence["deployment_payload_source"] = payload_source
 
     backoff_schedule = [0, 5, 15]
@@ -4644,6 +5428,92 @@ def collect_evidence(
     return evidence
 
 
+def _deployment_docs_penalty_reason(evidence: dict[str, Any]) -> str:
+    if int(evidence.get("deployment_docs_example_present", 0)) != 1:
+        error_text = str(evidence.get("deployment_docs_example_error", "")).strip()
+        if error_text == "openapi_example_unparseable":
+            return "openapi_example_unparseable"
+        return "no_openapi_example"
+
+    if int(evidence.get("deployment_docs_example_valid", 0)) == 1:
+        return ""
+
+    status_code = str(evidence.get("deployment_docs_example_predict_status_code", "")).strip()
+    if status_code == "422":
+        return "openapi_example_422"
+    if status_code == "500":
+        return "openapi_example_500"
+
+    error_text = str(evidence.get("deployment_docs_example_error", "")).strip()
+    if error_text == "openapi_example_unparseable":
+        return "openapi_example_unparseable"
+
+    return "wrong_openapi_example"
+
+
+def _deployment_live_payload_strategy(evidence: dict[str, Any]) -> str:
+    if int(evidence.get("deployment_service_reachable", 0)) != 1:
+        return "service_unreachable"
+
+    if int(evidence.get("deployment_valid_prediction_response", 0)) == 1:
+        if int(evidence.get("deployment_missing_field_repair_succeeded", 0)) == 1:
+            return "fallback_missing_field_repaired_success"
+        if int(evidence.get("deployment_docs_example_present", 0)) == 1:
+            if int(evidence.get("deployment_docs_example_repair_applied", 0)) == 1:
+                return "docs_repaired_success"
+            if int(evidence.get("deployment_docs_example_valid", 0)) == 1:
+                return "docs_only_success"
+            fallback_source = str(evidence.get("deployment_fallback_payload_source", "")).strip()
+            if fallback_source and fallback_source != "missing":
+                return "docs_failed_fallback_success"
+            return "docs_failed_no_fallback_success"
+
+        payload_source = str(evidence.get("deployment_payload_source", "")).strip()
+        if payload_source and payload_source != "empty_fallback":
+            return "no_docs_fallback_success"
+        return "no_payload_reachable_only"
+
+    payload_source = str(evidence.get("deployment_payload_source", "")).strip()
+    if payload_source == "empty_fallback" or not payload_source:
+        return "no_payload_reachable_only"
+
+    if int(evidence.get("deployment_docs_example_present", 0)) == 1:
+        return "docs_and_fallback_failed"
+
+    return "no_payload_reachable_only"
+
+
+def _deployment_comment_text(evidence: dict[str, Any]) -> str:
+    if int(evidence.get("deployment_public_url_present", 0)) != 1:
+        return "Public deployment URL is missing"
+
+    if int(evidence.get("deployment_service_reachable", 0)) != 1:
+        return "Deployment could not be validated because the service did not respond"
+
+    if int(evidence.get("deployment_valid_prediction_response", 0)) == 1:
+        if int(evidence.get("deployment_missing_field_repair_succeeded", 0)) == 1:
+            return "Live deployment works, but the documented /predict example uses the wrong field names"
+        if int(evidence.get("deployment_docs_example_present", 0)) == 1:
+            if int(evidence.get("deployment_docs_example_repair_applied", 0)) == 1:
+                return "Live deployment works, but the deployed /predict docs example is wrong and required a simple numeric fix"
+            if int(evidence.get("deployment_docs_example_valid", 0)) == 1:
+                return "Live deployment responds correctly and the deployed docs example also works"
+            return "Live deployment works, but the deployed /predict docs example is wrong"
+        return "Live deployment responds correctly, but no deployed docs example could be validated"
+
+    payload_source = str(evidence.get("deployment_payload_source", "")).strip()
+    if payload_source == "empty_fallback":
+        return "Service is reachable, but no valid payload could be derived to test /predict"
+
+    if int(evidence.get("deployment_healthcheck_ok", 0)) == 1:
+        return "Health check works, but live inference is not functioning"
+
+    if int(evidence.get("deployment_predict_accepts_valid_json", 0)) == 1:
+        return "Live service accepts requests, but the prediction response is not valid"
+
+    return "Service is reachable, but no valid payload could be derived to test /predict"
+
+
 def compute_proxy_scores(
     evidence: dict[str, Any],
     selected_dimensions: set[str],
@@ -5187,6 +6057,30 @@ def compute_proxy_scores(
             score = 0.0
 
         scores[DIMENSION_TO_SCORE_COLUMN["version_control"]] = round2(score)
+
+    if _is_selected(selected_dimensions, "deployment"):
+        evidence["deployment_live_payload_strategy"] = _deployment_live_payload_strategy(evidence)
+        evidence["deployment_docs_penalty_reason"] = _deployment_docs_penalty_reason(evidence)
+
+        deployment_score_col = DIMENSION_TO_SCORE_COLUMN["deployment"]
+        wrong_docs_example_penalty = safe_float(
+            cfg_get(config, "scoring.deployment.wrong_docs_example_penalty", 2.0),
+            2.0,
+        )
+        if (
+            int(evidence.get("deployment_valid_prediction_response", 0)) == 1
+            and (
+                (
+                    int(evidence.get("deployment_docs_example_present", 0)) == 1
+                    and int(evidence.get("deployment_docs_example_valid", 0)) == 0
+                    and evidence.get("deployment_live_payload_strategy") == "docs_failed_fallback_success"
+                )
+                or evidence.get("deployment_live_payload_strategy")
+                == "fallback_missing_field_repaired_success"
+            )
+        ):
+            current_score = safe_float(scores.get(deployment_score_col, 0.0))
+            scores[deployment_score_col] = round2(clamp(current_score - wrong_docs_example_penalty))
 
     return scores
 
@@ -5781,6 +6675,9 @@ def make_dimension_comments(
         comments["overall_comment"] = "First-pass qualitative feedback generated from the selected rubric dimensions"
     else:
         comments["overall_comment"] = "No rubric dimensions were selected for this run"
+
+    if _is_selected(selected_dimensions, "deployment"):
+        comments["deployment_comment"] = _deployment_comment_text(evidence)
 
     return comments
 

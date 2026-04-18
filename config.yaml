@@ -144,6 +144,7 @@ scoring:
     monitoring_healthcheck_signal: 1.0
 
   deployment:
+    wrong_docs_example_penalty: 2.0
     deployment_public_url_present: 1.0
     deployment_service_reachable: 2.0
     deployment_predict_accepts_valid_json: 3.5

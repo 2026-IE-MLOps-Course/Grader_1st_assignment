@@ -405,19 +405,25 @@ def main() -> None:
                     "repo_url": repo.repo_url,
                     "branch": repo.branch,
                     "cutoff_commit": commit,
-                    **empty_score_payload(),
-                    **scores,
+                    "is_benchmark": int(repo.is_benchmark),
+                    "dimensions_run": ",".join(sorted(selected_dimensions)),
                 }
-                if documentation_score_is_qualitative_only(config):
-                    score_row[DIMENSION_TO_SCORE_COLUMN["documentation"]] = ""
-                score_row["total_raw_score"] = round(
-                    sum(
-                        float(score_row[col])
-                        for col in DIMENSION_TO_SCORE_COLUMN.values()
-                        if score_row.get(col) not in ("", None)
-                    ),
-                    2,
-                )
+                total = 0.0
+                ran_any = False
+                docs_qualitative_only = documentation_score_is_qualitative_only(config)
+                for dimension, score_col in DIMENSION_TO_SCORE_COLUMN.items():
+                    if dimension in selected_dimensions:
+                        if dimension == "documentation" and docs_qualitative_only:
+                            score_row[score_col] = ""
+                            continue
+                        value = round2(scores.get(score_col, 0.0))
+                        score_row[score_col] = value
+                        total += value
+                        ran_any = True
+                    else:
+                        score_row[score_col] = ""
+
+                score_row["total_raw_score"] = round2(total) if ran_any else ""
 
                 evidence_row = {
                     "repo_id": repo.repo_id,
@@ -431,6 +437,7 @@ def main() -> None:
                     "repo_url": repo.repo_url,
                     "branch": repo.branch,
                     "cutoff_commit": commit,
+                    "dimensions_run": ",".join(sorted(selected_dimensions)),
                     **comments,
                 }
             else:
