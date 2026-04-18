@@ -149,6 +149,12 @@ scoring:
     deployment_predict_accepts_valid_json: 3.5
     deployment_valid_prediction_response: 3.5
 
+  github_workflow_discipline:
+    ghwf_pr_to_main_signal: 5.0
+    ghwf_checks_evidence_signal: 2.0
+    ghwf_branch_hygiene_signal: 3.0
+    no_pr_to_main_cap: 3.0
+
   error_handling:
     validation_function_present: 1.0
     validation_raise_present: 1.0

@@ -53,6 +53,7 @@ DIMENSION_CHOICES = [
     "ci_cd",
     "monitoring",
     "deployment",
+    "github_workflow_discipline",
 ]
 
 ALL_DIMENSIONS = [d for d in DIMENSION_CHOICES if d != "all"]
