@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+import sys
 import traceback
 from pathlib import Path
 from typing import Any
@@ -94,6 +95,8 @@ DIMENSION_GROUPS = {
     ],
     "all": ALL_DIMENSIONS,
 }
+
+GITHUB_REQUIRED_FINAL_DIMENSIONS = {"release_discipline", "github_workflow_discipline"}
 
 
 class TrackExplicitDimensions(argparse.Action):
@@ -258,6 +261,19 @@ def resolve_selected_dimensions(args: argparse.Namespace) -> set[str]:
     if args.dimension_group:
         return normalize_dimensions(DIMENSION_GROUPS[args.dimension_group])
     return normalize_dimensions(args.dimensions)
+
+
+def github_token_warning_for_dimensions(selected_dimensions: set[str]) -> str | None:
+    if os.getenv("GITHUB_TOKEN", "").strip():
+        return None
+    impacted = sorted(selected_dimensions & GITHUB_REQUIRED_FINAL_DIMENSIONS)
+    if not impacted:
+        return None
+    impacted_text = ", ".join(impacted)
+    return (
+        "Warning: GITHUB_TOKEN is missing; "
+        f"{impacted_text} will use unauthenticated GitHub API evidence and may be only partially verified."
+    )
 
 
 def resolve_effective_deployment_urls_file(
@@ -506,6 +522,9 @@ def main() -> None:
     feedback_rows: list[dict[str, Any]] = []
 
     print(f"Selected dimensions: {', '.join(sorted(selected_dimensions))}")
+    github_warning = github_token_warning_for_dimensions(selected_dimensions)
+    if github_warning:
+        print(github_warning, file=sys.stderr)
 
     if args.local_repo_path:
         repo, repo_dir = prepare_local_repo_spec(args.local_repo_path)

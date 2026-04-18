@@ -238,6 +238,8 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "release_is_prerelease",
         "release_is_draft",
         "release_count_found",
+        "release_published_at_used",
+        "release_github_api_authenticated",
         "release_cap_reason",
     ],
     "github_workflow_discipline": [
@@ -2460,25 +2462,110 @@ def _infer_import_signals(tree: ast.AST) -> tuple[set[str], set[str]]:
     return infer_function_names, infer_module_aliases
 
 
+def _top_level_helper_names(tree: ast.AST) -> set[str]:
+    helper_names: set[str] = set()
+    if not isinstance(tree, ast.Module):
+        return helper_names
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            helper_names.add(node.name)
+    return helper_names
+
+
+def _imported_callable_names(tree: ast.AST) -> set[str]:
+    imported_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            imported_names.add(alias.asname or alias.name)
+    return imported_names
+
+
+def _imported_module_aliases(tree: ast.AST) -> set[str]:
+    module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import):
+            continue
+        for alias in node.names:
+            module_aliases.add(alias.asname or alias.name.split(".")[-1])
+    return module_aliases
+
+
 def _predict_calls_inference_logic(
     predict_handlers: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    local_helper_names: set[str],
+    imported_callable_names: set[str],
+    imported_module_aliases: set[str],
     infer_function_names: set[str],
     infer_module_aliases: set[str],
 ) -> bool:
+    helper_name_pattern = re.compile(
+        r"(clean|validat|infer|predict|preprocess|prepare|transform|feature|serve|score|pipeline|model)",
+        flags=re.IGNORECASE,
+    )
+    excluded_helper_names = {
+        "jsonresponse",
+        "httpexception",
+        "dict",
+        "list",
+        "set",
+        "tuple",
+        "len",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "print",
+    }
+
     for handler in predict_handlers:
+        direct_model_call_found = False
+        delegated_helper_calls: set[str] = set()
+
         for node in ast.walk(handler):
             if not isinstance(node, ast.Call):
                 continue
-            if isinstance(node.func, ast.Name) and node.func.id in infer_function_names.union({"run_inference"}):
-                return True
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"predict", "predict_proba"}
+            ):
+                direct_model_call_found = True
+                continue
+
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+                if func_name in infer_function_names.union({"run_inference"}):
+                    delegated_helper_calls.add(func_name)
+                    continue
+
+                if (
+                    func_name in local_helper_names.union(imported_callable_names)
+                    and func_name.lower() not in excluded_helper_names
+                    and func_name != handler.name
+                ):
+                    delegated_helper_calls.add(func_name)
+                continue
+
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in infer_module_aliases
+                and node.func.value.id in infer_module_aliases.union(imported_module_aliases)
             ):
-                return True
-            if isinstance(node.func, ast.Attribute) and node.func.attr in {"predict", "predict_proba"}:
-                return True
+                helper_name = node.func.attr
+                if helper_name.lower() not in excluded_helper_names:
+                    delegated_helper_calls.add(helper_name)
+
+        if direct_model_call_found:
+            continue
+
+        if any(helper_name_pattern.search(name) for name in delegated_helper_calls):
+            return True
+        if len(delegated_helper_calls) >= 2:
+            return True
     return False
 
 
@@ -2553,10 +2640,16 @@ def scan_api_serving(repo_dir: Path) -> dict[str, Any]:
         _predict_uses_pydantic_contract(predict_handlers, base_model_names)
     )
 
+    local_helper_names = _top_level_helper_names(tree)
+    imported_callable_names = _imported_callable_names(tree)
+    imported_module_aliases = _imported_module_aliases(tree)
     infer_function_names, infer_module_aliases = _infer_import_signals(tree)
     evidence["api_predict_calls_inference_logic"] = int(
         _predict_calls_inference_logic(
             predict_handlers,
+            local_helper_names,
+            imported_callable_names,
+            imported_module_aliases,
             infer_function_names,
             infer_module_aliases,
         )
@@ -3167,6 +3260,22 @@ def scan_monitoring(repo_dir: Path) -> dict[str, Any]:
     )
 
     return evidence
+
+
+def cutoff_datetime_utc(cutoff_str: str, timezone_name: str) -> datetime:
+    local_dt = datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=ZoneInfo(timezone_name)
+    )
+    return local_dt.astimezone(ZoneInfo("UTC"))
+
+
+def parse_github_datetime(timestamp: Any) -> datetime | None:
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def normalize_deployment_url(url: str) -> str:
@@ -5676,7 +5785,11 @@ def scan_github_workflow(
     }
 
 
-def scan_release_discipline(repo: RepoSpec) -> dict[str, Any]:
+def scan_release_discipline(
+    repo: RepoSpec,
+    cutoff_str: str,
+    timezone_name: str,
+) -> dict[str, Any]:
     evidence = {
         "release_found": 0,
         "release_tag_name": "",
@@ -5685,6 +5798,8 @@ def scan_release_discipline(repo: RepoSpec) -> dict[str, Any]:
         "release_is_prerelease": 0,
         "release_is_draft": 0,
         "release_count_found": 0,
+        "release_published_at_used": "",
+        "release_github_api_authenticated": github_authenticated(),
         "release_cap_reason": "",
     }
 
@@ -5707,21 +5822,34 @@ def scan_release_discipline(repo: RepoSpec) -> dict[str, Any]:
     if not isinstance(payload, list):
         return evidence
 
+    cutoff_utc = cutoff_datetime_utc(cutoff_str, timezone_name)
+
     non_draft_releases = [
         release for release in payload
         if isinstance(release, dict) and not bool(release.get("draft", False))
     ]
-    evidence["release_count_found"] = len(non_draft_releases)
     if not non_draft_releases:
         return evidence
 
-    first_release = non_draft_releases[0]
+    eligible_releases: list[dict[str, Any]] = []
+    for release in non_draft_releases:
+        published_at = parse_github_datetime(release.get("published_at"))
+        if published_at is not None and published_at <= cutoff_utc:
+            eligible_releases.append(release)
+
+    evidence["release_count_found"] = len(eligible_releases)
+    if not eligible_releases:
+        evidence["release_cap_reason"] = "release_after_cutoff"
+        return evidence
+
+    first_release = eligible_releases[0]
     evidence["release_found"] = 1
     evidence["release_tag_name"] = str(first_release.get("tag_name", "")).strip()
     evidence["release_target_commitish"] = str(first_release.get("target_commitish", "")).strip()
     evidence["release_targets_main"] = int(evidence["release_target_commitish"] == "main")
     evidence["release_is_prerelease"] = int(bool(first_release.get("prerelease", False)))
     evidence["release_is_draft"] = int(bool(first_release.get("draft", False)))
+    evidence["release_published_at_used"] = str(first_release.get("published_at", "")).strip()
 
     return evidence
 
@@ -5802,7 +5930,13 @@ def collect_evidence(
         )
 
     if _is_selected(selected_dimensions, "release_discipline"):
-        evidence.update(scan_release_discipline(repo))
+        evidence.update(
+            scan_release_discipline(
+                repo,
+                cutoff_str=cutoff_str,
+                timezone_name=timezone_name,
+            )
+        )
 
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
@@ -5896,32 +6030,32 @@ def _deployment_comment_text(evidence: dict[str, Any]) -> str:
         return "Public deployment URL is missing"
 
     if int(evidence.get("deployment_service_reachable", 0)) != 1:
-        return "Deployment could not be validated because the service did not respond"
+        return "Deployment did not respond to the live probe"
 
     if int(evidence.get("deployment_valid_prediction_response", 0)) == 1:
         if int(evidence.get("deployment_composed_fallback_repair_succeeded", 0)) == 1:
-            return "Live deployment works, but the documented /predict example uses wrong field names and invalid numeric example values"
+            return "Live deployment works, but the documented `/predict` example needs field and value fixes"
         if int(evidence.get("deployment_missing_field_repair_succeeded", 0)) == 1:
-            return "Live deployment works, but the documented /predict example uses the wrong field names"
+            return "Live deployment works, but the documented `/predict` example uses wrong field names"
         if int(evidence.get("deployment_docs_example_present", 0)) == 1:
             if int(evidence.get("deployment_docs_example_repair_applied", 0)) == 1:
-                return "Live deployment works, but the deployed /predict docs example is wrong and required a simple numeric fix"
+                return "Live deployment works, but the documented `/predict` example required a numeric fix"
             if int(evidence.get("deployment_docs_example_valid", 0)) == 1:
-                return "Live deployment responds correctly and the deployed docs example also works"
-            return "Live deployment works, but the deployed /predict docs example is wrong"
-        return "Live deployment responds correctly, but no deployed docs example could be validated"
+                return "Live deployment and the documented `/predict` example both work"
+            return "Live deployment works, but the documented `/predict` example fails"
+        return "Live deployment works, but no `/predict` example could be validated"
 
     payload_source = str(evidence.get("deployment_payload_source", "")).strip()
     if payload_source == "empty_fallback":
-        return "Service is reachable, but no valid payload could be derived to test /predict"
+        return "Service is reachable, but no valid payload was available for `/predict`"
 
     if int(evidence.get("deployment_healthcheck_ok", 0)) == 1:
-        return "Health check works, but live inference is not functioning"
+        return "Health check works, but live inference fails"
 
     if int(evidence.get("deployment_predict_accepts_valid_json", 0)) == 1:
-        return "Live service accepts requests, but the prediction response is not valid"
+        return "Service accepts requests, but the prediction response is invalid"
 
-    return "Service is reachable, but no valid payload could be derived to test /predict"
+    return "Service is reachable, but `/predict` could not be validated"
 
 
 def compute_proxy_scores(
@@ -6834,21 +6968,19 @@ def make_dimension_comments(
         predict_calls_inference_logic = int(evidence.get("api_predict_calls_inference_logic", 0) or 0)
 
         if not fastapi_app_present:
-            comments["api_serving_comment"] = "No real FastAPI serving layer is clearly evidenced"
+            comments["api_serving_comment"] = "No FastAPI app found"
         elif not predict_endpoint_present:
-            comments["api_serving_comment"] = "FastAPI app exists, but /predict is missing"
+            comments["api_serving_comment"] = "/predict route missing"
         elif not predict_calls_inference_logic:
-            comments["api_serving_comment"] = "Predict endpoint exists, but inference logic is not clearly wired"
+            comments["api_serving_comment"] = "/predict handles inference inline instead of delegating to a serving helper"
         elif not pydantic_contract_present:
-            comments["api_serving_comment"] = "API endpoints exist, but the Pydantic contract is not clearly enforced"
+            comments["api_serving_comment"] = "Pydantic request model not evident on /predict"
         elif not uvicorn_serving_present:
-            comments["api_serving_comment"] = "Uvicorn serving is not clearly evidenced"
+            comments["api_serving_comment"] = "Uvicorn entrypoint not evident"
         elif health_endpoint_present and predict_endpoint_present:
-            comments["api_serving_comment"] = (
-                "FastAPI serves /health and /predict with a clear Pydantic request contract"
-            )
+            comments["api_serving_comment"] = "FastAPI `/health` and `/predict` are wired through a serving helper"
         else:
-            comments["api_serving_comment"] = "FastAPI app exists, but /health is missing"
+            comments["api_serving_comment"] = "/health route missing"
     else:
         comments["api_serving_comment"] = skipped()
 
@@ -6893,19 +7025,15 @@ def make_dimension_comments(
         cd_release_only = int(evidence.get("cd_triggered_by_release_only", 0) or 0)
 
         if ci_present and ci_pr and ci_validation and cd_present and cd_release_only:
-            comments["ci_cd_comment"] = (
-                "CI validates pull requests with clear automated checks, and the repo also includes a release-gated deploy workflow"
-            )
+            comments["ci_cd_comment"] = "CI validates pull requests; a release-gated deploy workflow is also present"
         elif ci_present and ci_pr and ci_validation:
-            comments["ci_cd_comment"] = "CI validates pull requests with clear automated checks"
+            comments["ci_cd_comment"] = "CI validates pull requests"
         elif not ci_present:
             comments["ci_cd_comment"] = "No CI workflow found"
         elif not ci_pr:
-            comments["ci_cd_comment"] = "CI exists but does not trigger on pull requests"
+            comments["ci_cd_comment"] = "CI workflow does not trigger on pull requests"
         elif not ci_validation:
-            comments["ci_cd_comment"] = (
-                "CI workflow is present, but validation steps are not clearly evidenced"
-            )
+            comments["ci_cd_comment"] = "CI workflow lacks clear validation steps"
         else:
             comments["ci_cd_comment"] = "No CI workflow found"
     else:
@@ -6917,6 +7045,7 @@ def make_dimension_comments(
         api_logging = int(evidence.get("monitoring_api_logging_signal", 0) or 0)
         wandb_inference = int(evidence.get("monitoring_wandb_inference_telemetry_signal", 0) or 0)
         healthcheck = int(evidence.get("monitoring_healthcheck_signal", 0) or 0)
+        render_documented = int(evidence.get("monitoring_render_runtime_documented", 0) or 0)
 
         signal_items = [
             ("monitoring_local_runtime_log_signal", "runtime logs", local_runtime_log),
@@ -6948,35 +7077,13 @@ def make_dimension_comments(
             return f"{items[0]}, {items[1]}, and {items[2]}"
 
         if present_count == 5:
-            comments["monitoring_comment"] = (
-                "Operational traceability is strong across runtime logs, request tracing, and inference telemetry"
-            )
-        elif 3 <= present_count <= 4:
-            top_missing = _format_missing_items(missing_items[:2])
-            if present_count == 4:
-                comments["monitoring_comment"] = (
-                    f"Runtime monitoring is present, but {top_missing} are missing"
-                )
-            else:
-                comments["monitoring_comment"] = (
-                    f"Monitoring is solid, but {top_missing} are missing"
-                )
-        elif 1 <= present_count <= 2:
-            top_missing = _format_missing_items(missing_items[:3])
-            if healthcheck and not local_runtime_log and not request_trace and not api_logging and not wandb_inference:
-                comments["monitoring_comment"] = (
-                    f"Only basic health visibility is present; {top_missing} are missing"
-                )
-            elif api_logging and not local_runtime_log and not request_trace and not wandb_inference and not healthcheck:
-                comments["monitoring_comment"] = (
-                    f"Basic API logging is present, but {top_missing} are missing"
-                )
-            else:
-                comments["monitoring_comment"] = (
-                    f"Monitoring evidence is partial; {top_missing} are missing"
-                )
+            comments["monitoring_comment"] = "Runtime logs, tracing, API logging, inference telemetry, and health checks are evidenced"
+        elif present_count >= 1:
+            comments["monitoring_comment"] = f"Monitoring missing: {_format_missing_items(missing_items[:3])}"
+        elif render_documented:
+            comments["monitoring_comment"] = "Render or health monitoring is documented, but runtime monitoring was not verified"
         else:
-            comments["monitoring_comment"] = "No clear runtime monitoring signals were found"
+            comments["monitoring_comment"] = "Runtime monitoring signals are missing"
     else:
         comments["monitoring_comment"] = skipped()
 
@@ -6992,27 +7099,18 @@ def make_dimension_comments(
         if not public_url_present:
             comments["deployment_comment"] = "Public deployment URL is missing"
         elif not service_reachable:
-            timestamp_suffix = f" ({checked_at_utc})" if checked_at_utc else ""
-            comments["deployment_comment"] = (
-                "Deployment could not be validated because the service did not respond"
-                + timestamp_suffix
-            )
+            timestamp_suffix = f" at {checked_at_utc}" if checked_at_utc else ""
+            comments["deployment_comment"] = f"Deployment did not respond to the live probe{timestamp_suffix}"
         elif payload_source in {"missing", "empty_fallback"}:
-            comments["deployment_comment"] = (
-                "Service is reachable, but no valid payload could be derived to test /predict"
-            )
+            comments["deployment_comment"] = "Service is reachable, but no valid payload was available for `/predict`"
         elif healthcheck_ok and not predict_accepts:
-            comments["deployment_comment"] = "Health check works, but live inference is not functioning"
+            comments["deployment_comment"] = "Health check works, but live inference fails"
         elif not predict_accepts:
             comments["deployment_comment"] = "Service is reachable, but prediction requests fail"
         elif not valid_response:
-            comments["deployment_comment"] = (
-                "Live service accepts requests, but the prediction response is not valid"
-            )
+            comments["deployment_comment"] = "Service accepts requests, but the prediction response is invalid"
         else:
-            comments["deployment_comment"] = (
-                "Live deployment responds correctly and returns valid predictions"
-            )
+            comments["deployment_comment"] = "Live deployment returns valid predictions"
     else:
         comments["deployment_comment"] = skipped()
 
@@ -7122,56 +7220,65 @@ def make_dimension_comments(
         merged_prs_to_main = int(evidence.get("ghwf_merged_prs_to_main", 0) or 0)
         checks_evidence_signal = int(evidence.get("ghwf_checks_evidence_signal", 0) or 0)
         branch_hygiene_signal = int(evidence.get("ghwf_branch_hygiene_signal", 0) or 0)
+        github_authenticated_flag = int(evidence.get("ghwf_github_api_authenticated", 0) or 0)
 
-        if score >= 10.0:
-            comments["github_workflow_discipline_comment"] = (
-                "Pull Request workflow to main is clear, repository hygiene is clean, and checks evidence is visible"
-            )
+        if not github_authenticated_flag:
+            if merged_prs_to_main >= 1 or checks_evidence_signal or branch_hygiene_signal:
+                comments["github_workflow_discipline_comment"] = (
+                    "GitHub workflow evidence is partial because `GITHUB_TOKEN` is missing"
+                )
+            else:
+                comments["github_workflow_discipline_comment"] = (
+                    "GitHub workflow could not be fully verified because `GITHUB_TOKEN` is missing"
+                )
+        elif score >= 10.0:
+            comments["github_workflow_discipline_comment"] = "PRs to main, checks evidence, and branch hygiene are all evidenced"
         elif score >= 8.0:
-            comments["github_workflow_discipline_comment"] = (
-                "Pull Request workflow to main is clear and repository hygiene is clean, though checks evidence is limited"
-            )
+            comments["github_workflow_discipline_comment"] = "PRs to main and branch hygiene are evidenced; checks evidence is limited"
         elif score >= 6.0:
-            comments["github_workflow_discipline_comment"] = (
-                "Pull Requests into main are used, but workflow evidence is only partial or branch hygiene is weaker"
-            )
+            comments["github_workflow_discipline_comment"] = "PRs to main are evidenced, but checks evidence or branch hygiene is partial"
         elif 3.0 <= score <= 4.0:
-            comments["github_workflow_discipline_comment"] = (
-                "Limited clear Pull Request workflow to main was evidenced"
-            )
-        elif merged_prs_to_main >= 1 or checks_evidence_signal or branch_hygiene_signal:
-            comments["github_workflow_discipline_comment"] = (
-                "GitHub workflow discipline could not be fully validated from available GitHub evidence"
-            )
+            comments["github_workflow_discipline_comment"] = "Only limited PR-to-main workflow evidence was found"
         else:
-            comments["github_workflow_discipline_comment"] = (
-                "GitHub workflow discipline could not be fully validated from available GitHub evidence"
-            )
+            comments["github_workflow_discipline_comment"] = "GitHub workflow discipline could not be fully verified"
     else:
         comments["github_workflow_discipline_comment"] = skipped()
 
-    ran_comments = [value for key, value in comments.items() if key.endswith("_comment") and value != "SKIPPED"]
-    if ran_comments:
-        comments["overall_comment"] = "First-pass qualitative feedback generated from the selected rubric dimensions"
-    else:
-        comments["overall_comment"] = "No rubric dimensions were selected for this run"
-
     if _is_selected(selected_dimensions, "release_discipline"):
-        if int(evidence.get("release_found", 0)) != 1:
-            comments["release_discipline_comment"] = (
-                "No GitHub Release was found, so there is no auditable evidence that production deploys are tied to a formal release"
-            )
-        elif int(evidence.get("release_targets_main", 0)) != 1:
-            comments["release_discipline_comment"] = (
-                "A GitHub Release exists, but it does not target the main branch as required by the rubric"
-            )
+        release_found = int(evidence.get("release_found", 0) or 0)
+        release_targets_main = int(evidence.get("release_targets_main", 0) or 0)
+        release_cap_reason = str(evidence.get("release_cap_reason", "") or "")
+        github_authenticated_flag = int(evidence.get("release_github_api_authenticated", 0) or 0)
+
+        if release_found != 1 and release_cap_reason == "release_after_cutoff":
+            comments["release_discipline_comment"] = "No GitHub Release published on or before the cutoff was found"
+        elif release_found != 1:
+            comments["release_discipline_comment"] = "No qualifying GitHub Release was found"
+        elif release_targets_main != 1:
+            comments["release_discipline_comment"] = "A pre-cutoff release was found, but it does not target `main`"
+        elif not github_authenticated_flag:
+            comments["release_discipline_comment"] = "A pre-cutoff release to `main` was found; GitHub verification was unauthenticated"
         else:
-            comments["release_discipline_comment"] = (
-                "A formal GitHub Release targeting main was found, which matches the release discipline requirement"
-            )
+            comments["release_discipline_comment"] = "A pre-cutoff release targeting `main` was found"
 
     if _is_selected(selected_dimensions, "deployment"):
         comments["deployment_comment"] = _deployment_comment_text(evidence)
+
+    scored_gap_dimensions: list[str] = []
+    for dimension in sorted(selected_dimensions):
+        score_col = DIMENSION_TO_SCORE_COLUMN.get(dimension)
+        if not score_col:
+            continue
+        score = scores.get(score_col)
+        if isinstance(score, (int, float)) and float(score) < 10.0:
+            scored_gap_dimensions.append(dimension)
+
+    if scored_gap_dimensions:
+        comments["overall_comment"] = "Gaps flagged in: " + ", ".join(scored_gap_dimensions[:4])
+    elif any(value != "SKIPPED" for key, value in comments.items() if key.endswith("_comment")):
+        comments["overall_comment"] = "No clear automated gaps were flagged in the selected dimensions"
+    else:
+        comments["overall_comment"] = "No rubric dimensions were selected for this run"
 
     return comments
 
