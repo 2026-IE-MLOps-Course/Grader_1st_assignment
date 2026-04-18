@@ -52,6 +52,7 @@ DIMENSION_CHOICES = [
     "containerization",
     "ci_cd",
     "monitoring",
+    "release_discipline",
     "deployment",
     "github_workflow_discipline",
 ]

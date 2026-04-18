@@ -52,6 +52,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "ci_cd": "ci_cd_score",
     "monitoring": "monitoring_score",
     "deployment": "deployment_score",
+    "release_discipline": "release_discipline_score",
     "github_workflow_discipline": "github_workflow_discipline_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
@@ -207,6 +208,9 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "deployment_missing_field_repair_succeeded",
         "deployment_missing_field_repair_reason",
         "deployment_missing_field_repaired_status_code",
+        "deployment_composed_fallback_repair_attempted",
+        "deployment_composed_fallback_repair_succeeded",
+        "deployment_composed_fallback_repair_reason",
         "deployment_fallback_payload_source",
         "deployment_live_payload_strategy",
         "deployment_docs_penalty_reason",
@@ -225,6 +229,16 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "deployment_response_excerpt",
         "deployment_error_message",
         "deployment_checked_at_utc",
+    ],
+    "release_discipline": [
+        "release_found",
+        "release_tag_name",
+        "release_target_commitish",
+        "release_targets_main",
+        "release_is_prerelease",
+        "release_is_draft",
+        "release_count_found",
+        "release_cap_reason",
     ],
     "github_workflow_discipline": [
         "ghwf_pr_to_main_signal",
@@ -3993,6 +4007,31 @@ def _deployment_field_from_text(message_text: str) -> str:
     return ""
 
 
+def _deployment_parse_string_detail_errors(detail_str: str) -> list[tuple[str, str]]:
+    """
+    Parse custom string validation detail into (field_name, message_text) pairs.
+
+    Handles both:
+    - single-line strings like:
+      "Data validation found 1 issue(s): - 'days': must be at least 1"
+    - multi-line strings like:
+      "Data validation found 2 issue(s):\n  - 'duration_days': 1 values below minimum (1)\n  - 'traveler_age': 1 values below minimum (1)"
+
+    Returns empty list if nothing parseable.
+    """
+    parsed_errors: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r"-\s+['\"]([A-Za-z0-9_.-]+)['\"]\s*:\s*(.*?)(?=\s+-\s+['\"]|$)",
+        flags=re.DOTALL,
+    )
+    for match in pattern.finditer(str(detail_str)):
+        field_name = match.group(1).strip()
+        message_text = match.group(2).strip()
+        if field_name and message_text:
+            parsed_errors.append((field_name, message_text))
+    return parsed_errors
+
+
 def _deployment_constraint_from_validation_entry(entry: Any) -> dict[str, Any] | None:
     if not isinstance(entry, dict):
         return None
@@ -4107,6 +4146,14 @@ def _deployment_repair_numeric_docs_example(
             loc_path = _deployment_loc_path_from_validation_entry(entry)
             field_name = _deployment_field_from_text(str(entry.get("msg", "")).strip())
             repair_actions.append((loc_path, constraint, field_name))
+    elif isinstance(response_json, dict) and isinstance(response_json.get("detail"), str):
+        for field_name, message_text in _deployment_parse_string_detail_errors(response_json.get("detail", "")):
+            constraint = _deployment_constraint_from_text(message_text)
+            if constraint is None:
+                continue
+            candidate_paths = _deployment_find_key_paths(repaired_payload, field_name)
+            if len(candidate_paths) == 1:
+                repair_actions.append((candidate_paths[0], constraint, field_name))
 
     if not repair_actions:
         error_text = str(docs_probe.get("error", "")).strip()
@@ -4284,6 +4331,9 @@ def scan_deployment(
         "deployment_missing_field_repair_succeeded": 0,
         "deployment_missing_field_repair_reason": "",
         "deployment_missing_field_repaired_status_code": "",
+        "deployment_composed_fallback_repair_attempted": 0,
+        "deployment_composed_fallback_repair_succeeded": 0,
+        "deployment_composed_fallback_repair_reason": "",
         "deployment_fallback_payload_source": "",
         "deployment_live_payload_strategy": "",
         "deployment_docs_penalty_reason": "",
@@ -4392,6 +4442,33 @@ def scan_deployment(
                 if repaired_fallback_probe["valid"] == 1:
                     evidence["deployment_missing_field_repair_succeeded"] = 1
                     payload = repaired_fallback_payload
+                elif _deployment_docs_error_is_validation_like(repaired_fallback_probe):
+                    numeric_repaired_payload, numeric_repair_reason = _deployment_repair_numeric_docs_example(
+                        repaired_fallback_payload,
+                        repaired_fallback_probe,
+                    )
+                    evidence["deployment_composed_fallback_repair_attempted"] = 1
+                    if numeric_repaired_payload is not None:
+                        numeric_repaired_probe = probe_deployment_predict_payload_once(
+                            evidence["deployment_predict_url"],
+                            numeric_repaired_payload,
+                        )
+                        if numeric_repaired_probe["valid"] == 1:
+                            evidence["deployment_composed_fallback_repair_succeeded"] = 1
+                            evidence["deployment_composed_fallback_repair_reason"] = (
+                                "alias_then_numeric_success"
+                            )
+                            payload = numeric_repaired_payload
+                        else:
+                            evidence["deployment_composed_fallback_repair_reason"] = (
+                                "alias_success_numeric_failed"
+                            )
+                    else:
+                        evidence["deployment_composed_fallback_repair_reason"] = (
+                            "alias_failed_no_numeric_attempt"
+                            if numeric_repair_reason == "non_repairable_runtime_error"
+                            else "alias_success_numeric_failed"
+                        )
 
     evidence["deployment_payload_source"] = payload_source
 
@@ -5564,6 +5641,56 @@ def scan_github_workflow(
     }
 
 
+def scan_release_discipline(repo: RepoSpec) -> dict[str, Any]:
+    evidence = {
+        "release_found": 0,
+        "release_tag_name": "",
+        "release_target_commitish": "",
+        "release_targets_main": 0,
+        "release_is_prerelease": 0,
+        "release_is_draft": 0,
+        "release_count_found": 0,
+        "release_cap_reason": "",
+    }
+
+    if repo.repo_url.startswith("local://"):
+        return evidence
+
+    owner, repo_name = parse_owner_repo(repo.repo_url)
+    api_url = f"https://api.github.com/repos/{owner}/{repo_name}/releases"
+    headers = github_headers()
+
+    try:
+        response = requests.get(api_url, headers=headers, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException:
+        return evidence
+    except ValueError:
+        return evidence
+
+    if not isinstance(payload, list):
+        return evidence
+
+    non_draft_releases = [
+        release for release in payload
+        if isinstance(release, dict) and not bool(release.get("draft", False))
+    ]
+    evidence["release_count_found"] = len(non_draft_releases)
+    if not non_draft_releases:
+        return evidence
+
+    first_release = non_draft_releases[0]
+    evidence["release_found"] = 1
+    evidence["release_tag_name"] = str(first_release.get("tag_name", "")).strip()
+    evidence["release_target_commitish"] = str(first_release.get("target_commitish", "")).strip()
+    evidence["release_targets_main"] = int(evidence["release_target_commitish"] == "main")
+    evidence["release_is_prerelease"] = int(bool(first_release.get("prerelease", False)))
+    evidence["release_is_draft"] = int(bool(first_release.get("draft", False)))
+
+    return evidence
+
+
 def collect_evidence(
     repo_dir: Path,
     repo: RepoSpec,
@@ -5639,6 +5766,9 @@ def collect_evidence(
             )
         )
 
+    if _is_selected(selected_dimensions, "release_discipline"):
+        evidence.update(scan_release_discipline(repo))
+
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
         evidence.update(run_pylint(repo_dir))
@@ -5697,6 +5827,8 @@ def _deployment_live_payload_strategy(evidence: dict[str, Any]) -> str:
         return "service_unreachable"
 
     if int(evidence.get("deployment_valid_prediction_response", 0)) == 1:
+        if int(evidence.get("deployment_composed_fallback_repair_succeeded", 0)) == 1:
+            return "fallback_alias_then_numeric_repaired_success"
         if int(evidence.get("deployment_missing_field_repair_succeeded", 0)) == 1:
             return "fallback_missing_field_repaired_success"
         if int(evidence.get("deployment_docs_example_present", 0)) == 1:
@@ -5732,6 +5864,8 @@ def _deployment_comment_text(evidence: dict[str, Any]) -> str:
         return "Deployment could not be validated because the service did not respond"
 
     if int(evidence.get("deployment_valid_prediction_response", 0)) == 1:
+        if int(evidence.get("deployment_composed_fallback_repair_succeeded", 0)) == 1:
+            return "Live deployment works, but the documented /predict example uses wrong field names and invalid numeric example values"
         if int(evidence.get("deployment_missing_field_repair_succeeded", 0)) == 1:
             return "Live deployment works, but the documented /predict example uses the wrong field names"
         if int(evidence.get("deployment_docs_example_present", 0)) == 1:
@@ -6299,6 +6433,21 @@ def compute_proxy_scores(
 
         scores[DIMENSION_TO_SCORE_COLUMN["version_control"]] = round2(score)
 
+    if _is_selected(selected_dimensions, "release_discipline"):
+        release_score_col = DIMENSION_TO_SCORE_COLUMN["release_discipline"]
+        release_found_points = safe_float(
+            cfg_get(config, "scoring.release_discipline.release_found_points", 5.0),
+            5.0,
+        )
+        release_targets_main_points = safe_float(
+            cfg_get(config, "scoring.release_discipline.release_targets_main_points", 5.0),
+            5.0,
+        )
+        scores[release_score_col] = round2(
+            release_found_points * int(evidence.get("release_found", 0))
+            + release_targets_main_points * int(evidence.get("release_targets_main", 0))
+        )
+
     if _is_selected(selected_dimensions, "deployment"):
         evidence["deployment_live_payload_strategy"] = _deployment_live_payload_strategy(evidence)
         evidence["deployment_docs_penalty_reason"] = _deployment_docs_penalty_reason(evidence)
@@ -6318,6 +6467,8 @@ def compute_proxy_scores(
                 )
                 or evidence.get("deployment_live_payload_strategy")
                 == "fallback_missing_field_repaired_success"
+                or evidence.get("deployment_live_payload_strategy")
+                == "fallback_alias_then_numeric_repaired_success"
             )
         ):
             current_score = safe_float(scores.get(deployment_score_col, 0.0))
@@ -6969,6 +7120,20 @@ def make_dimension_comments(
         comments["overall_comment"] = "First-pass qualitative feedback generated from the selected rubric dimensions"
     else:
         comments["overall_comment"] = "No rubric dimensions were selected for this run"
+
+    if _is_selected(selected_dimensions, "release_discipline"):
+        if int(evidence.get("release_found", 0)) != 1:
+            comments["release_discipline_comment"] = (
+                "No GitHub Release was found, so there is no auditable evidence that production deploys are tied to a formal release"
+            )
+        elif int(evidence.get("release_targets_main", 0)) != 1:
+            comments["release_discipline_comment"] = (
+                "A GitHub Release exists, but it does not target the main branch as required by the rubric"
+            )
+        else:
+            comments["release_discipline_comment"] = (
+                "A formal GitHub Release targeting main was found, which matches the release discipline requirement"
+            )
 
     if _is_selected(selected_dimensions, "deployment"):
         comments["deployment_comment"] = _deployment_comment_text(evidence)

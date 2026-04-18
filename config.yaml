@@ -145,6 +145,9 @@ scoring:
 
   deployment:
     wrong_docs_example_penalty: 2.0
+  release_discipline:
+    release_found_points: 5.0
+    release_targets_main_points: 5.0
     deployment_public_url_present: 1.0
     deployment_service_reachable: 2.0
     deployment_predict_accepts_valid_json: 3.5
