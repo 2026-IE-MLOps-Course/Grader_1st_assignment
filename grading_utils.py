@@ -52,6 +52,7 @@ DIMENSION_TO_SCORE_COLUMN = {
     "ci_cd": "ci_cd_score",
     "monitoring": "monitoring_score",
     "deployment": "deployment_score",
+    "github_workflow_discipline": "github_workflow_discipline_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -224,6 +225,21 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
         "deployment_response_excerpt",
         "deployment_error_message",
         "deployment_checked_at_utc",
+    ],
+    "github_workflow_discipline": [
+        "ghwf_pr_to_main_signal",
+        "ghwf_checks_evidence_signal",
+        "ghwf_branch_hygiene_signal",
+        "ghwf_default_branch_name",
+        "ghwf_total_prs_scanned",
+        "ghwf_merged_prs_to_main",
+        "ghwf_prs_with_status_evidence",
+        "ghwf_prs_with_success_status",
+        "ghwf_branch_count",
+        "ghwf_non_main_non_dev_branch_count",
+        "ghwf_github_api_used",
+        "ghwf_github_api_authenticated",
+        "ghwf_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -5248,6 +5264,222 @@ def list_pull_requests(owner: str, repo: str, cutoff_iso: str) -> list[dict[str,
     return collected
 
 
+def github_authenticated() -> int:
+    return int(bool(os.getenv("GITHUB_TOKEN", "").strip()))
+
+
+def github_workflow_defaults() -> dict[str, Any]:
+    return {
+        "ghwf_pr_to_main_signal": 0,
+        "ghwf_checks_evidence_signal": 0,
+        "ghwf_branch_hygiene_signal": 0,
+        "ghwf_default_branch_name": "",
+        "ghwf_total_prs_scanned": 0,
+        "ghwf_merged_prs_to_main": 0,
+        "ghwf_prs_with_status_evidence": 0,
+        "ghwf_prs_with_success_status": 0,
+        "ghwf_branch_count": 0,
+        "ghwf_non_main_non_dev_branch_count": 0,
+        "ghwf_github_api_used": 0,
+        "ghwf_github_api_authenticated": github_authenticated(),
+        "ghwf_cap_reason": "",
+    }
+
+
+def github_repo_metadata(owner: str, repo: str) -> dict[str, Any] | None:
+    payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}")
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def list_pull_requests_limited(
+    owner: str,
+    repo: str,
+    base_branch: str,
+    limit: int = 20,
+) -> list[dict[str, Any]] | None:
+    collected: list[dict[str, Any]] = []
+    page = 1
+
+    while len(collected) < limit:
+        per_page = min(100, limit - len(collected))
+        payload, _ = github_get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            {
+                "state": "closed",
+                "base": base_branch,
+                "sort": "created",
+                "direction": "desc",
+                "per_page": per_page,
+                "page": page,
+            },
+        )
+        if payload is None:
+            return None
+        if not isinstance(payload, list) or not payload:
+            break
+
+        for pr in payload:
+            collected.append(pr)
+            if len(collected) >= limit:
+                break
+
+        if len(payload) < per_page:
+            break
+        page += 1
+
+    return collected
+
+
+def list_branches(owner: str, repo: str) -> list[dict[str, Any]] | None:
+    collected: list[dict[str, Any]] = []
+    page = 1
+
+    while page <= 2:
+        payload, _ = github_get(
+            f"https://api.github.com/repos/{owner}/{repo}/branches",
+            {"per_page": 100, "page": page},
+        )
+        if payload is None:
+            return None
+        if not isinstance(payload, list) or not payload:
+            break
+
+        collected.extend(branch for branch in payload if isinstance(branch, dict))
+        if len(payload) < 100:
+            break
+        page += 1
+
+    return collected
+
+
+def commit_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs")
+    if not isinstance(payload, dict):
+        return []
+    check_runs = payload.get("check_runs")
+    if not isinstance(check_runs, list):
+        return []
+    return [check for check in check_runs if isinstance(check, dict)]
+
+
+def commit_statuses(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/status")
+    if not isinstance(payload, dict):
+        return []
+    statuses = payload.get("statuses")
+    if not isinstance(statuses, list):
+        return []
+    return [status for status in statuses if isinstance(status, dict)]
+
+
+def scan_github_workflow_discipline(
+    repo: RepoSpec,
+    cutoff_str: str,
+    timezone_name: str,
+) -> dict[str, Any]:
+    evidence = github_workflow_defaults()
+
+    if repo.repo_url.startswith("local://"):
+        return evidence
+
+    owner, repo_name = parse_owner_repo(repo.repo_url)
+    cutoff_dt = datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=ZoneInfo(timezone_name)
+    )
+    cutoff_iso = cutoff_dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    metadata = github_repo_metadata(owner, repo_name)
+    if not metadata:
+        evidence["ghwf_github_api_used"] = 1
+        if not evidence["ghwf_github_api_authenticated"]:
+            evidence["ghwf_cap_reason"] = "github_api_partial"
+        return evidence
+
+    evidence["ghwf_github_api_used"] = 1
+    default_branch = str(metadata.get("default_branch") or "").strip()
+    evidence["ghwf_default_branch_name"] = default_branch
+
+    # Edge case: scanning the most recently updated PRs across all branches can miss a valid
+    # merged PR to the default branch, so spend the 20-PR budget on closed default-branch PRs.
+    # Acceptable duplication: if version_control is also selected, this metric may fetch PRs again.
+    prs = list_pull_requests_limited(owner, repo_name, default_branch, limit=20)
+    if prs is None:
+        evidence["ghwf_cap_reason"] = "github_api_partial"
+        return evidence
+    evidence["ghwf_total_prs_scanned"] = len(prs)
+
+    merged_prs_to_main: list[dict[str, Any]] = []
+    for pr in prs:
+        base_ref = ((pr.get("base") or {}).get("ref") or "").strip()
+        merged_at = pr.get("merged_at")
+        if base_ref == default_branch and merged_at is not None and merged_at <= cutoff_iso:
+            merged_prs_to_main.append(pr)
+
+    evidence["ghwf_merged_prs_to_main"] = len(merged_prs_to_main)
+    evidence["ghwf_pr_to_main_signal"] = int(len(merged_prs_to_main) >= 1)
+
+    if not evidence["ghwf_pr_to_main_signal"]:
+        evidence["ghwf_cap_reason"] = "no_pr_to_main"
+
+    if evidence["ghwf_github_api_authenticated"]:
+        sample_prs = merged_prs_to_main[:3]
+        prs_with_status_evidence = 0
+        prs_with_success_status = 0
+
+        for pr in sample_prs:
+            sha = ((pr.get("head") or {}).get("sha") or "").strip()
+            if not sha:
+                continue
+
+            check_runs = commit_check_runs(owner, repo_name, sha)
+            statuses: list[dict[str, Any]] = []
+            if not check_runs:
+                statuses = commit_statuses(owner, repo_name, sha)
+
+            if check_runs or statuses:
+                prs_with_status_evidence += 1
+
+            if any(
+                (check.get("conclusion") or "").lower() == "success"
+                for check in check_runs
+            ) or any(
+                (status.get("state") or "").lower() == "success"
+                for status in statuses
+            ):
+                prs_with_success_status += 1
+
+        evidence["ghwf_prs_with_status_evidence"] = prs_with_status_evidence
+        evidence["ghwf_prs_with_success_status"] = prs_with_success_status
+        evidence["ghwf_checks_evidence_signal"] = int(prs_with_status_evidence >= 1)
+    else:
+        if evidence["ghwf_cap_reason"] != "no_pr_to_main":
+            evidence["ghwf_cap_reason"] = "github_api_partial"
+
+    branches = list_branches(owner, repo_name)
+    if branches is None:
+        if evidence["ghwf_cap_reason"] != "no_pr_to_main":
+            evidence["ghwf_cap_reason"] = "github_api_partial"
+        return evidence
+    evidence["ghwf_branch_count"] = len(branches)
+
+    non_main_non_dev_branch_count = 0
+    for branch in branches:
+        branch_name = str(branch.get("name") or "").strip().lower()
+        if not branch_name:
+            continue
+        if branch_name == default_branch.lower():
+            continue
+        if branch_name in {"dev", "development"}:
+            continue
+        non_main_non_dev_branch_count += 1
+
+    evidence["ghwf_non_main_non_dev_branch_count"] = non_main_non_dev_branch_count
+    evidence["ghwf_branch_hygiene_signal"] = int(non_main_non_dev_branch_count <= 5)
+    return evidence
+
+
 def list_reviews(owner: str, repo: str, pr_number: int, cutoff_iso: str) -> list[dict[str, Any]]:
     payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews")
     if not isinstance(payload, list):
@@ -5419,6 +5651,15 @@ def collect_evidence(
         evidence.update(scan_git_history(repo_dir))
         evidence.update(
             scan_github_workflow(
+                repo=repo,
+                cutoff_str=cutoff_str,
+                timezone_name=timezone_name,
+            )
+        )
+
+    if _is_selected(selected_dimensions, "github_workflow_discipline"):
+        evidence.update(
+            scan_github_workflow_discipline(
                 repo=repo,
                 cutoff_str=cutoff_str,
                 timezone_name=timezone_name,
@@ -6082,6 +6323,26 @@ def compute_proxy_scores(
             current_score = safe_float(scores.get(deployment_score_col, 0.0))
             scores[deployment_score_col] = round2(clamp(current_score - wrong_docs_example_penalty))
 
+    if _is_selected(selected_dimensions, "github_workflow_discipline"):
+        section = cfg_get(config, "scoring.github_workflow_discipline", {})
+        pr_to_main_signal = int(evidence.get("ghwf_pr_to_main_signal", 0) or 0)
+        checks_evidence_signal = int(evidence.get("ghwf_checks_evidence_signal", 0) or 0)
+        branch_hygiene_signal = int(evidence.get("ghwf_branch_hygiene_signal", 0) or 0)
+        cap_reason = str(evidence.get("ghwf_cap_reason", "") or "")
+
+        score = 0.0
+        if pr_to_main_signal:
+            score += safe_float(cfg_get(section, "ghwf_pr_to_main_signal", 0.0))
+        if checks_evidence_signal:
+            score += safe_float(cfg_get(section, "ghwf_checks_evidence_signal", 0.0))
+        if branch_hygiene_signal:
+            score += safe_float(cfg_get(section, "ghwf_branch_hygiene_signal", 0.0))
+
+        if cap_reason == "no_pr_to_main":
+            score = min(score, safe_float(cfg_get(section, "no_pr_to_main_cap", 3.0)))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["github_workflow_discipline"]] = round2(clamp(score))
+
     return scores
 
 
@@ -6669,6 +6930,39 @@ def make_dimension_comments(
             comments["version_control_workflow_comment"] = "Little or no usable Pull Request workflow evidence was found"
     else:
         comments["version_control_workflow_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "github_workflow_discipline"):
+        score = safe_float(scores.get(DIMENSION_TO_SCORE_COLUMN["github_workflow_discipline"], 0.0))
+        merged_prs_to_main = int(evidence.get("ghwf_merged_prs_to_main", 0) or 0)
+        checks_evidence_signal = int(evidence.get("ghwf_checks_evidence_signal", 0) or 0)
+        branch_hygiene_signal = int(evidence.get("ghwf_branch_hygiene_signal", 0) or 0)
+
+        if score >= 10.0:
+            comments["github_workflow_discipline_comment"] = (
+                "Pull Request workflow to main is clear, repository hygiene is clean, and checks evidence is visible"
+            )
+        elif score >= 8.0:
+            comments["github_workflow_discipline_comment"] = (
+                "Pull Request workflow to main is clear and repository hygiene is clean, though checks evidence is limited"
+            )
+        elif score >= 6.0:
+            comments["github_workflow_discipline_comment"] = (
+                "Pull Requests into main are used, but workflow evidence is only partial or branch hygiene is weaker"
+            )
+        elif 3.0 <= score <= 4.0:
+            comments["github_workflow_discipline_comment"] = (
+                "Limited clear Pull Request workflow to main was evidenced"
+            )
+        elif merged_prs_to_main >= 1 or checks_evidence_signal or branch_hygiene_signal:
+            comments["github_workflow_discipline_comment"] = (
+                "GitHub workflow discipline could not be fully validated from available GitHub evidence"
+            )
+        else:
+            comments["github_workflow_discipline_comment"] = (
+                "GitHub workflow discipline could not be fully validated from available GitHub evidence"
+            )
+    else:
+        comments["github_workflow_discipline_comment"] = skipped()
 
     ran_comments = [value for key, value in comments.items() if key.endswith("_comment") and value != "SKIPPED"]
     if ran_comments:
