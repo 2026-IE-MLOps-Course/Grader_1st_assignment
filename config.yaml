@@ -1,6 +1,8 @@
 submission:
   cutoff_datetime: "2026-03-27 23:59:59"
   timezone: "Europe/Madrid"
+  repos_file: repos.txt
+  deployment_urls_file: deployment_urls.csv
 
 scoring:
   modularization:
@@ -45,6 +47,119 @@ scoring:
 
   dependencies:
     env_or_conda_present: 10.0
+
+  config_reproducibility:
+    config_yaml_present: 1.5
+    config_yaml_has_keys: 0.5
+    environment_yml_present: 1.0
+    conda_lock_yml_present: 2.0
+    main_reads_config_signal: 2.0
+    env_contract_signal: 0.5
+    gitignore_excludes_env: 0.5
+    dotenv_usage_signal: 0.5
+    runtime_config_keys_min: 3
+    runtime_config_keys_points: 1.5
+    hardcoded_path_penalty: 0.5
+    hardcoded_path_penalty_cap: 1.5
+    hardcoded_hyperparam_penalty: 0.5
+    hardcoded_hyperparam_penalty_cap: 1.5
+    missing_config_yaml_cap: 4.0
+    missing_conda_lock_cap: 8.0
+    secret_literal_cap: 6.0
+
+  security_secrets:
+    sec_gitignore_excludes_env: 3.5
+    sec_dockerignore_excludes_env: 2.5
+    sec_no_secret_literals: 4.0
+    sec_tracked_env_cap: 2.0
+    sec_secret_literal_cap: 4.0
+    sec_tracked_env_like_files_cap: 5.0
+
+  logging_observability:
+    log_print_free: 3.0
+    log_logger_module_present: 1.5
+    log_file_handler_present: 1.5
+    log_stream_handler_present: 1.0
+    log_dual_output_signal: 1.0
+    log_logfile_path_present: 0.5
+    log_logger_usage_signal: 1.5
+    print_calls_allowed: 3
+    print_calls_cap: 6.0
+    too_many_print_calls_cap: 5.0
+    missing_logger_module_cap: 4.0
+    missing_dual_output_cap: 6.0
+    missing_usage_cap: 8.0
+    fallback_logger_module_penalty: 1.0
+
+  experiment_tracking:
+    wandb_import_present: 0.5
+    wandb_init_in_main: 2.0
+    wandb_config_logged: 1.5
+    wandb_run_metadata_logged: 1.5
+    wandb_eval_metrics_logged: 2.5
+    wandb_rich_eval_tracking_logged: 0.5
+    wandb_model_artifact_logged: 1.5
+    missing_wandb_init_in_main_cap: 4.0
+    missing_eval_metrics_cap: 5.0
+    missing_model_artifact_cap: 8.0
+
+  model_registry:
+    reg_serving_path_registry_backed: 7.0
+    reg_serving_prod_alias_used: 3.0
+    production_override_enabled: true
+    missing_registry_serving_cap: 2.0
+    missing_prod_alias_cap: 7.0
+    local_fallback_cap: 7.0
+    local_only_cap: 0.0
+
+  api_serving:
+    api_fastapi_app_present: 2.5
+    api_pydantic_contract_present: 2.0
+    api_health_endpoint_present: 1.5
+    api_predict_endpoint_present: 2.5
+    api_uvicorn_serving_present: 1.5
+    no_fastapi_app_cap: 0.0
+    missing_predict_endpoint_cap: 5.0
+    predict_without_inference_logic_cap: 7.0
+
+  containerization:
+    dockerfile_present: 2.0
+    docker_serving_entrypoint_present: 3.0
+    dockerignore_present: 1.0
+    dockerignore_quality_signal: 2.5
+    docker_reproducible_install_signal: 1.5
+    no_dockerfile_cap: 0.0
+    non_serving_docker_entrypoint_cap: 5.0
+    missing_dockerignore_cap: 6.0
+
+  ci_cd:
+    ci_workflow_present: 2.5
+    ci_triggers_on_pr: 3.5
+    ci_runs_validation_steps: 4.0
+    missing_pr_trigger_cap: 5.0
+
+  monitoring:
+    monitoring_local_runtime_log_signal: 2.5
+    monitoring_api_request_trace_signal: 2.5
+    monitoring_api_logging_signal: 2.0
+    monitoring_wandb_inference_telemetry_signal: 2.0
+    monitoring_healthcheck_signal: 1.0
+
+  deployment:
+    wrong_docs_example_penalty: 2.0
+    deployment_public_url_present: 1.0
+    deployment_service_reachable: 2.0
+    deployment_predict_accepts_valid_json: 3.5
+    deployment_valid_prediction_response: 3.5
+  release_discipline:
+    release_found_points: 5.0
+    release_targets_main_points: 5.0
+
+  github_workflow_discipline:
+    ghwf_pr_to_main_signal: 5.0
+    ghwf_checks_evidence_signal: 2.0
+    ghwf_branch_hygiene_signal: 3.0
+    no_pr_to_main_cap: 3.0
 
   error_handling:
     validation_function_present: 1.0

@@ -10,13 +10,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -41,6 +42,18 @@ DIMENSION_TO_SCORE_COLUMN = {
     "documentation": "documentation_clarity",
     "testing": "testing_coverage",
     "dependencies": "dependency_management",
+    "config_reproducibility": "config_reproducibility_score",
+    "security_secrets": "security_secrets_score",
+    "logging_observability": "logging_observability_score",
+    "experiment_tracking": "experiment_tracking_score",
+    "model_registry": "model_registry_score",
+    "api_serving": "api_serving_score",
+    "containerization": "containerization_score",
+    "ci_cd": "ci_cd_score",
+    "monitoring": "monitoring_score",
+    "deployment": "deployment_score",
+    "release_discipline": "release_discipline_score",
+    "github_workflow_discipline": "github_workflow_discipline_score",
     "error_handling": "error_handling_validation",
     "artifacting": "artifacting_reproducibility",
     "pipeline": "pipeline_completeness",
@@ -76,6 +89,173 @@ EVIDENCE_FIELDS_BY_DIMENSION = {
     "dependencies": [
         "environment_yml_present",
         "conda_yml_present",
+    ],
+    "config_reproducibility": [
+        "config_yaml_present",
+        "config_yaml_has_keys",
+        "runtime_config_keys_found",
+        "env_contract_signal",
+        "gitignore_excludes_env",
+        "environment_yml_present",
+        "conda_lock_yml_present",
+        "main_reads_config_signal",
+        "dotenv_usage_signal",
+        "code_hardcoded_path_hits",
+        "code_hardcoded_hyperparam_hits",
+        "secret_like_literal_hits",
+        "config_reproducibility_cap_reason",
+    ],
+    "security_secrets": [
+        "sec_gitignore_excludes_env",
+        "sec_dockerignore_present",
+        "sec_dockerignore_excludes_env",
+        "sec_env_file_present",
+        "sec_env_file_tracked_by_git",
+        "sec_env_example_present",
+        "sec_dotenv_usage_signal",
+        "sec_secret_literal_hits",
+        "sec_secret_literal_files",
+        "sec_tracked_env_like_files",
+        "security_secrets_cap_reason",
+    ],
+    "logging_observability": [
+        "log_print_statement_hits",
+        "log_print_free",
+        "log_print_hit_files",
+        "log_logger_module_present",
+        "log_logger_module_path",
+        "log_logger_module_name",
+        "log_logger_module_fallback_used",
+        "log_file_handler_present",
+        "log_stream_handler_present",
+        "log_dual_output_signal",
+        "log_logfile_path_present",
+        "log_logger_usage_signal",
+        "log_logger_usage_count",
+        "logging_observability_cap_reason",
+    ],
+    "experiment_tracking": [
+        "wandb_import_present",
+        "wandb_init_in_main",
+        "wandb_config_logged",
+        "wandb_run_metadata_logged",
+        "wandb_eval_metrics_logged",
+        "wandb_rich_eval_tracking_logged",
+        "wandb_model_artifact_logged",
+        "wandb_cap_reason",
+    ],
+    "model_registry": [
+        "reg_serving_path_registry_backed",
+        "reg_serving_prod_alias_used",
+        "reg_production_registry_selected",
+        "reg_serving_local_fallback_present",
+        "reg_serving_local_only",
+        "reg_model_registry_cap_reason",
+    ],
+    "api_serving": [
+        "api_fastapi_app_present",
+        "api_pydantic_contract_present",
+        "api_health_endpoint_present",
+        "api_predict_endpoint_present",
+        "api_uvicorn_serving_present",
+        "api_predict_calls_inference_logic",
+        "api_serving_cap_reason",
+    ],
+    "containerization": [
+        "dockerfile_present",
+        "docker_serving_entrypoint_present",
+        "dockerignore_present",
+        "dockerignore_quality_signal",
+        "docker_reproducible_install_signal",
+        "dockerignore_excluded_noise_count",
+        "containerization_cap_reason",
+    ],
+    "ci_cd": [
+        "ci_workflow_present",
+        "ci_triggers_on_pr",
+        "ci_runs_validation_steps",
+        "cd_workflow_present",
+        "cd_triggered_by_release_only",
+        "cd_triggered_on_push_flag",
+        "ci_workflow_file",
+        "cd_workflow_file",
+        "ci_validation_step_hits",
+        "ci_cd_cap_reason",
+    ],
+    "monitoring": [
+        "monitoring_local_runtime_log_signal",
+        "monitoring_api_request_trace_signal",
+        "monitoring_api_logging_signal",
+        "monitoring_wandb_inference_telemetry_signal",
+        "monitoring_healthcheck_signal",
+        "monitoring_render_runtime_documented",
+        "monitoring_cap_reason",
+    ],
+    "deployment": [
+        "deployment_public_url_present",
+        "deployment_service_reachable",
+        "deployment_predict_accepts_valid_json",
+        "deployment_valid_prediction_response",
+        "deployment_docs_example_present",
+        "deployment_docs_example_source",
+        "deployment_docs_example_predict_status_code",
+        "deployment_docs_example_valid",
+        "deployment_docs_example_error",
+        "deployment_docs_example_repair_attempted",
+        "deployment_docs_example_repair_applied",
+        "deployment_docs_example_repair_reason",
+        "deployment_missing_field_repair_attempted",
+        "deployment_missing_field_repair_succeeded",
+        "deployment_missing_field_repair_reason",
+        "deployment_missing_field_repaired_status_code",
+        "deployment_composed_fallback_repair_attempted",
+        "deployment_composed_fallback_repair_succeeded",
+        "deployment_composed_fallback_repair_reason",
+        "deployment_fallback_payload_source",
+        "deployment_live_payload_strategy",
+        "deployment_docs_penalty_reason",
+        "deployment_repo_id_used",
+        "deployment_url_file_used",
+        "deployment_url_match_mode",
+        "deployment_base_url",
+        "deployment_predict_url",
+        "deployment_health_url",
+        "deployment_healthcheck_ok",
+        "deployment_health_status_code",
+        "deployment_predict_status_code",
+        "deployment_timeout_flag",
+        "deployment_retry_count",
+        "deployment_payload_source",
+        "deployment_response_excerpt",
+        "deployment_error_message",
+        "deployment_checked_at_utc",
+    ],
+    "release_discipline": [
+        "release_found",
+        "release_tag_name",
+        "release_target_commitish",
+        "release_targets_main",
+        "release_is_prerelease",
+        "release_is_draft",
+        "release_count_found",
+        "release_published_at_used",
+        "release_github_api_authenticated",
+        "release_cap_reason",
+    ],
+    "github_workflow_discipline": [
+        "ghwf_pr_to_main_signal",
+        "ghwf_checks_evidence_signal",
+        "ghwf_branch_hygiene_signal",
+        "ghwf_default_branch_name",
+        "ghwf_total_prs_scanned",
+        "ghwf_merged_prs_to_main",
+        "ghwf_prs_with_status_evidence",
+        "ghwf_prs_with_success_status",
+        "ghwf_branch_count",
+        "ghwf_non_main_non_dev_branch_count",
+        "ghwf_github_api_used",
+        "ghwf_github_api_authenticated",
+        "ghwf_cap_reason",
     ],
     "error_handling": [
         "validation_function_present",
@@ -217,6 +397,15 @@ def clamp(value: float, low: float = 0.0, high: float = 10.0) -> float:
 
 def round2(value: Any) -> float:
     return round(safe_float(value), 2)
+
+
+def safe_unparse(node: ast.AST | None) -> str:
+    if node is None:
+        return ""
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return ""
 
 
 def slugify_repo_name(text: str) -> str:
@@ -568,6 +757,937 @@ def _clean_python_for_detection(text: str) -> str:
     text = re.sub(r"'''[\s\S]*?'''", " ", text)
     text = re.sub(r"#.*", " ", text)
     return text.lower()
+
+
+def _is_test_or_setup_path(path: Path) -> bool:
+    lowered_parts = {part.lower() for part in path.parts}
+    lowered_name = path.name.lower()
+    lowered_stem = path.stem.lower()
+    return (
+        "tests" in lowered_parts
+        or lowered_name == "conftest.py"
+        or lowered_name == "setup.py"
+        or lowered_stem.startswith("test_")
+        or lowered_stem.endswith("_test")
+    )
+
+
+def production_python_files(repo_dir: Path) -> list[Path]:
+    return [path for path in python_files(repo_dir) if not _is_test_or_setup_path(path)]
+
+
+def _is_runtime_owner_python_path(repo_dir: Path, path: Path) -> bool:
+    if _is_test_or_setup_path(path) or is_notebook_path(path):
+        return False
+
+    try:
+        rel_path = path.relative_to(repo_dir)
+    except ValueError:
+        rel_path = path
+
+    rel_text = str(rel_path).lower()
+    stem = path.stem.lower()
+
+    if rel_text in {"main.py", "src/main.py"}:
+        return True
+
+    return any(token in stem for token in ["train", "trainer", "pipeline", "run"])
+
+
+def runtime_owner_python_files(repo_dir: Path) -> list[Path]:
+    return [path for path in production_python_files(repo_dir) if _is_runtime_owner_python_path(repo_dir, path)]
+
+
+def _count_yaml_leaf_keys(value: Any, depth: int = 0, max_depth: int = 4) -> int:
+    if depth > max_depth:
+        return 0
+    if isinstance(value, dict):
+        total = 0
+        for child in value.values():
+            if isinstance(child, dict):
+                total += _count_yaml_leaf_keys(child, depth + 1, max_depth)
+            elif isinstance(child, list):
+                total += _count_yaml_leaf_keys(child, depth + 1, max_depth)
+            else:
+                total += 1
+        return total
+    if isinstance(value, list):
+        total = 0
+        for child in value:
+            total += _count_yaml_leaf_keys(child, depth + 1, max_depth)
+        return total
+    return 0
+
+
+def _string_constant_value(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _runtime_path_literal(value: str | None) -> bool:
+    if not value:
+        return False
+    literal = value.strip().replace("\\", "/")
+    path_re = re.compile(
+        r"^(?:data|models|artifacts|outputs|reports)/[^'\"]+\.(?:csv|parquet|joblib|pkl|pickle)$",
+        flags=re.IGNORECASE,
+    )
+    return bool(path_re.search(literal))
+
+
+def _path_literal_hit_count(tree: ast.AST) -> int:
+    hits = 0
+    for node in ast.walk(tree):
+        literal_nodes: list[ast.AST] = []
+
+        if isinstance(node, ast.Assign):
+            literal_nodes.append(node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            literal_nodes.append(node.value)
+        elif isinstance(node, ast.Call):
+            literal_nodes.extend(
+                keyword.value for keyword in node.keywords if keyword.arg and keyword.value is not None
+            )
+
+        for literal_node in literal_nodes:
+            literal = _string_constant_value(literal_node)
+            if _runtime_path_literal(literal):
+                hits += 1
+
+    return hits
+
+
+def _name_contains_config_token(name: str) -> bool:
+    lowered = name.lower()
+    return any(token in lowered for token in ["config", "cfg", "settings", "params"])
+
+
+def _value_is_config_derived(node: ast.AST) -> bool:
+    if isinstance(node, ast.Name):
+        return _name_contains_config_token(node.id)
+
+    if isinstance(node, ast.Subscript):
+        return _value_is_config_derived(node.value)
+
+    if isinstance(node, ast.Attribute):
+        if _name_contains_config_token(node.attr):
+            return True
+        return _value_is_config_derived(node.value)
+
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Attribute):
+            return (
+                isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr == "getenv"
+            )
+        if isinstance(node.func, ast.Name):
+            return _name_contains_config_token(node.func.id)
+
+    return False
+
+
+def _numeric_constant_value(node: ast.AST) -> float | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return float(node.value)
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+    ):
+        value = _numeric_constant_value(node.operand)
+        return -value if value is not None else None
+    return None
+
+
+def _hyperparameter_hit_count(tree: ast.AST) -> int:
+    target_names = {
+        "n_estimators",
+        "max_depth",
+        "learning_rate",
+        "num_leaves",
+        "min_samples_split",
+        "min_samples_leaf",
+        "subsample",
+        "colsample_bytree",
+        "reg_alpha",
+        "reg_lambda",
+        "random_state",
+        "test_size",
+        "val_size",
+        "batch_size",
+        "epochs",
+        "dropout",
+    }
+    hits = 0
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if _value_is_config_derived(node.value):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id.lower() in target_names
+                    and _numeric_constant_value(node.value) is not None
+                ):
+                    hits += 1
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is None or _value_is_config_derived(node.value):
+                continue
+            if (
+                isinstance(node.target, ast.Name)
+                and node.target.id.lower() in target_names
+                and _numeric_constant_value(node.value) is not None
+            ):
+                hits += 1
+        elif isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg and keyword.arg.lower() in target_names:
+                    if _value_is_config_derived(keyword.value):
+                        continue
+                    if _numeric_constant_value(keyword.value) is not None:
+                        hits += 1
+
+    return hits
+
+
+def _secret_like_literal_hit_count(cleaned_text: str) -> int:
+    pattern = re.compile(
+        r"\b(?:api[_-]?key|token|secret|password|passwd|client_secret|access_key)\b\s*=\s*['\"][a-z0-9_\-\/+=]{8,}['\"]"
+    )
+    return len(pattern.findall(cleaned_text))
+
+
+def _scan_ignore_for_env(ignore_file_path: Path) -> int:
+    if not ignore_file_path.exists():
+        return 0
+    for raw_line in read_text(ignore_file_path).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        if line in {".env", ".env*", "*.env"}:
+            return 1
+    return 0
+
+
+def _git_ls_files(repo_dir: Path) -> list[str]:
+    result = run_command(["git", "ls-files"], cwd=repo_dir, timeout=120)
+    if not result["ok"]:
+        return []
+    return sorted(line.strip() for line in result["stdout"].splitlines() if line.strip())
+
+
+def _tracked_env_like_files(repo_dir: Path) -> list[str]:
+    safe_names = {".env.example", ".env.sample", ".env.template"}
+    risky: list[str] = []
+    for rel_path in _git_ls_files(repo_dir):
+        name = Path(rel_path).name.lower()
+        if name.startswith(".env") and name not in safe_names:
+            risky.append(rel_path)
+    return sorted(risky)
+
+
+def _tracked_source_like_files(repo_dir: Path) -> list[Path]:
+    tracked_files = _git_ls_files(repo_dir)
+    production_python_relpaths = {
+        str(path.relative_to(repo_dir)).replace("\\", "/")
+        for path in production_python_files(repo_dir)
+    }
+
+    selected: list[Path] = []
+    for rel_path in tracked_files:
+        rel_path_obj = Path(rel_path)
+        rel_text = rel_path.replace("\\", "/")
+        lowered = rel_text.lower()
+
+        if lowered in {"environment.yml", "conda-lock.yml"}:
+            continue
+        if any(part in lowered for part in ["/tests/", "/notebooks/", "/outputs/", "/feedback/", "/grading_workspace/"]):
+            continue
+        if lowered.startswith(("tests/", "notebooks/", "outputs/", "feedback/", "grading_workspace/")):
+            continue
+        if lowered.endswith((".lock", ".ipynb")):
+            continue
+
+        suffix = rel_path_obj.suffix.lower()
+        if suffix == ".py":
+            if rel_text not in production_python_relpaths:
+                continue
+        elif suffix not in {".yaml", ".yml", ".sh"}:
+            continue
+
+        selected.append(repo_dir / rel_path_obj)
+
+    return selected
+
+
+def _strip_non_python_comments(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _is_secret_like_name(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in {
+        "api_key",
+        "api-secret",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "client_secret",
+        "access_key",
+        "private_key",
+    }
+
+
+def _is_placeholder_secret_value(value: str) -> bool:
+    lowered = value.strip().lower()
+    return (
+        lowered.startswith("secrets.")
+        or lowered in {"your_token_here", "change_me", "todo"}
+        or "[" in value
+        or "]" in value
+    )
+
+
+def _is_env_reference_value(value: str) -> bool:
+    stripped = value.strip()
+    return bool(
+        re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", stripped)
+        or re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*", stripped)
+    )
+
+
+def _is_env_var_name_value(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_]{5,}", value.strip()))
+
+
+def _looks_like_real_secret_literal(value: str) -> bool:
+    stripped = value.strip().strip("'\"")
+    if len(stripped) < 12:
+        return False
+    if _is_placeholder_secret_value(stripped):
+        return False
+    if _is_env_reference_value(stripped):
+        return False
+    if _is_env_var_name_value(stripped):
+        return False
+    if stripped.lower().startswith("secrets."):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_./+=-]{12,}", stripped))
+
+
+def _python_secret_literal_match_count(text: str) -> int:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return 0
+
+    hits = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value = _string_constant_value(node.value)
+            if value is None or _is_placeholder_secret_value(value):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and _is_secret_like_name(target.id):
+                    hits += 1
+        elif isinstance(node, ast.AnnAssign):
+            value = _string_constant_value(node.value) if node.value is not None else None
+            if value is None or _is_placeholder_secret_value(value):
+                continue
+            if isinstance(node.target, ast.Name) and _is_secret_like_name(node.target.id):
+                hits += 1
+        elif isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                key = _string_constant_value(key_node) if key_node is not None else None
+                value = _string_constant_value(value_node)
+                if key and _is_secret_like_name(key) and value is not None and not _is_placeholder_secret_value(value):
+                    hits += 1
+
+    return hits
+
+
+def _secret_literal_match_count(text: str) -> int:
+    text = re.sub(r"\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsecrets\.[A-Za-z0-9_]+\b", " ", text, flags=re.IGNORECASE)
+    pattern = re.compile(
+        r"^(?:export\s+)?(?P<key>[A-Za-z0-9_\"'-]*(?:api[_-]?key|api-secret|token|secret|password|passwd|client_secret|access_key|private_key)[A-Za-z0-9_\"'-]*)"
+        r"\s*(?:=|:)\s*(?P<value>.+?)$",
+        flags=re.IGNORECASE,
+    )
+    hits = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = pattern.match(line)
+        if not match:
+            continue
+        key_text = match.group("key").strip().strip("'\"").lower()
+        if key_text.endswith(("_env", "_env_name", "_var")):
+            continue
+        value_text = match.group("value").strip()
+        if not _looks_like_real_secret_literal(value_text):
+            continue
+        hits += 1
+    return hits
+
+
+def _count_print_calls(tree: ast.AST) -> int:
+    hits = 0
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "print"
+        ):
+            hits += 1
+    return hits
+
+
+def _scan_logger_module(logger_path: Path) -> dict[str, int]:
+    cleaned = _clean_python_for_detection(read_text(logger_path))
+
+    file_handler_present = int(
+        "filehandler(" in cleaned
+        or "rotatingfilehandler(" in cleaned
+        or "timedrotatingfilehandler(" in cleaned
+    )
+    stream_handler_present = int("streamhandler(" in cleaned)
+    logfile_path_present = int(
+        bool(re.search(r'["\'][^"\']*\.log["\']', cleaned))
+        or bool(re.search(r'path\s*\([^)]*\.log', cleaned))
+    )
+
+    return {
+        "log_file_handler_present": file_handler_present,
+        "log_stream_handler_present": stream_handler_present,
+        "log_logfile_path_present": logfile_path_present,
+    }
+
+
+def scan_security_secrets(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "sec_gitignore_excludes_env": 0,
+        "sec_dockerignore_present": 0,
+        "sec_dockerignore_excludes_env": 0,
+        "sec_env_file_present": 0,
+        "sec_env_file_tracked_by_git": 0,
+        "sec_env_example_present": 0,
+        "sec_dotenv_usage_signal": 0,
+        "sec_secret_literal_hits": 0,
+        "sec_secret_literal_files": "",
+        "sec_tracked_env_like_files": "",
+        "security_secrets_cap_reason": "",
+    }
+
+    gitignore_path = repo_dir / ".gitignore"
+    dockerignore_path = repo_dir / ".dockerignore"
+    tracked_files = _git_ls_files(repo_dir)
+    tracked_env_like_files = _tracked_env_like_files(repo_dir)
+
+    evidence["sec_gitignore_excludes_env"] = _scan_ignore_for_env(gitignore_path)
+    evidence["sec_dockerignore_present"] = int(dockerignore_path.exists())
+    evidence["sec_dockerignore_excludes_env"] = _scan_ignore_for_env(dockerignore_path)
+    evidence["sec_env_file_present"] = int((repo_dir / ".env").exists())
+    evidence["sec_env_file_tracked_by_git"] = int(".env" in tracked_files)
+    evidence["sec_env_example_present"] = int((repo_dir / ".env.example").exists())
+    evidence["sec_tracked_env_like_files"] = " | ".join(tracked_env_like_files)
+
+    dotenv_hits = 0
+    for path in production_python_files(repo_dir):
+        cleaned = _clean_python_for_detection(read_text(path))
+        if "load_dotenv(" in cleaned or re.search(r"\bos\.getenv\s*\(", cleaned):
+            dotenv_hits += 1
+    evidence["sec_dotenv_usage_signal"] = int(dotenv_hits > 0)
+
+    secret_files: list[str] = []
+    secret_hits = 0
+    for path in _tracked_source_like_files(repo_dir):
+        text = read_text(path)
+        if path.suffix.lower() == ".py":
+            hits = _python_secret_literal_match_count(text)
+        else:
+            hits = _secret_literal_match_count(_strip_non_python_comments(text))
+        if hits > 0:
+            secret_hits += hits
+            secret_files.append(str(path.relative_to(repo_dir)).replace("\\", "/"))
+
+    evidence["sec_secret_literal_hits"] = secret_hits
+    evidence["sec_secret_literal_files"] = " | ".join(sorted(secret_files))
+    return evidence
+
+
+def scan_logging_observability(repo_dir: Path) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "log_print_statement_hits": 0,
+        "log_print_free": 0,
+        "log_print_hit_files": "",
+        "log_logger_module_present": 0,
+        "log_logger_module_path": "",
+        "log_logger_module_name": "",
+        "log_logger_module_fallback_used": 0,
+        "log_file_handler_present": 0,
+        "log_stream_handler_present": 0,
+        "log_dual_output_signal": 0,
+        "log_logfile_path_present": 0,
+        "log_logger_usage_signal": 0,
+        "log_logger_usage_count": 0,
+        "logging_observability_cap_reason": "",
+    }
+
+    total_print_hits = 0
+    print_hit_files: list[str] = []
+    for path in production_python_files(repo_dir):
+        text = read_text(path)
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+        hits = _count_print_calls(tree)
+        if hits > 0:
+            total_print_hits += hits
+            print_hit_files.append(str(path.relative_to(repo_dir)).replace("\\", "/"))
+
+    evidence["log_print_statement_hits"] = total_print_hits
+    allowed_print_calls = 3
+    evidence["log_print_free"] = int(total_print_hits <= allowed_print_calls)
+    evidence["log_print_hit_files"] = " | ".join(print_hit_files)
+
+    logger_path = repo_dir / "src" / "logger.py"
+    fallback_logger_path = repo_dir / "src" / "logging.py"
+    selected_logger_path: Path | None = None
+    if logger_path.exists():
+        selected_logger_path = logger_path
+        evidence["log_logger_module_present"] = 1
+        evidence["log_logger_module_path"] = "src/logger.py"
+        evidence["log_logger_module_name"] = "logger.py"
+        evidence["log_logger_module_fallback_used"] = 0
+    elif fallback_logger_path.exists():
+        selected_logger_path = fallback_logger_path
+        evidence["log_logger_module_present"] = 1
+        evidence["log_logger_module_path"] = "src/logging.py"
+        evidence["log_logger_module_name"] = "logging.py"
+        evidence["log_logger_module_fallback_used"] = 1
+
+    if selected_logger_path is not None:
+        evidence.update(_scan_logger_module(selected_logger_path))
+        evidence["log_dual_output_signal"] = int(
+            evidence["log_file_handler_present"]
+            and evidence["log_stream_handler_present"]
+        )
+
+    usage_count = 0
+    for path in production_python_files(repo_dir):
+        if selected_logger_path is not None and path.resolve() == selected_logger_path.resolve():
+            continue
+        cleaned = _clean_python_for_detection(read_text(path))
+        usage_patterns = ["get_logger(", "setup_logger(", "getlogger("]
+        if selected_logger_path == logger_path:
+            usage_patterns.extend(["from src.logger import", "import src.logger"])
+        elif selected_logger_path == fallback_logger_path:
+            usage_patterns.extend(["from src.logging import", "import src.logging"])
+        if any(pattern in cleaned for pattern in usage_patterns):
+            usage_count += 1
+
+    evidence["log_logger_usage_count"] = usage_count
+    evidence["log_logger_usage_signal"] = int(usage_count >= 1)
+    return evidence
+
+
+def scan_experiment_tracking(repo_dir: Path) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "wandb_import_present": 0,
+        "wandb_init_in_main": 0,
+        "wandb_config_logged": 0,
+        "wandb_run_metadata_logged": 0,
+        "wandb_eval_metrics_logged": 0,
+        "wandb_rich_eval_tracking_logged": 0,
+        "wandb_model_artifact_logged": 0,
+        "wandb_cap_reason": "",
+    }
+
+    production_cleaned: list[str] = []
+    for path in production_python_files(repo_dir):
+        cleaned = _clean_python_for_detection(read_text(path))
+        production_cleaned.append(cleaned)
+
+    if any(
+        "import wandb" in cleaned
+        or "from wandb import" in cleaned
+        or 'importlib.import_module("wandb")' in cleaned
+        or "importlib.import_module('wandb')" in cleaned
+        for cleaned in production_cleaned
+    ):
+        evidence["wandb_import_present"] = 1
+
+    main_path = _find_main_path(repo_dir)
+    main_cleaned = ""
+    if main_path and main_path.exists():
+        main_cleaned = _clean_python_for_detection(read_text(main_path))
+        if "wandb.init(" in main_cleaned or re.search(r"\b\w*wandb\w*\.init\s*\(", main_cleaned):
+            evidence["wandb_init_in_main"] = 1
+        if evidence["wandb_init_in_main"]:
+            idx = main_cleaned.find("wandb.init(")
+            if idx != -1:
+                window = main_cleaned[idx:idx + 800]
+                if "config=" in window:
+                    evidence["wandb_config_logged"] = 1
+
+    metadata_patterns = [
+        r"\braw_rows\b",
+        r"\braw_cols\b",
+        r"\bclean_rows\b",
+        r"\bclean_cols\b",
+        r"\btrain_rows\b",
+        r"\btrain_cols\b",
+        r"\btest_rows\b",
+        r"\btest_cols\b",
+        r"\bval_rows\b",
+        r"\bval_cols\b",
+        r"\btrain_size\b",
+        r"\btest_size\b",
+        r"\bval_size\b",
+        r"\bsplit(?:_| )sizes?\b",
+        r"\bselected_model_name\b",
+        r"\bentrypoint\b",
+        r"\bmodel_artifact_path\b",
+    ]
+    eval_namespace_patterns = [
+        r"metrics/",
+        r"\bval_",
+        r"\btest_",
+    ]
+    eval_metric_name_patterns = [
+        r"\brmse\b",
+        r"\bmae\b",
+        r"\baccuracy\b",
+        r"\bf1\b",
+        r"\bprecision\b",
+        r"\brecall\b",
+        r"\bauc\b",
+        r"\br2\b",
+    ]
+    eval_context_patterns = [
+        r"\beval",
+        r"\bevaluate",
+        r"\bevaluation\b",
+        r"\bmetric\b",
+        r"\bmetrics\b",
+        r"\bvalidation\b",
+        r"\btest\b",
+        r"\bval\b",
+    ]
+    rich_eval_tokens = [
+        "comparison_table",
+        "comparison table",
+        "confusion_matrix",
+        "confusion matrix",
+        "roc_curve",
+        "roc curve",
+        "pr_curve",
+        "pr curve",
+        "calibration_table",
+        "calibration table",
+    ]
+    model_context_tokens = [
+        "type=\"model\"",
+        "type='model'",
+        "model_artifact",
+        "model artifact",
+        "model_path",
+        "model.pkl",
+        "model.joblib",
+        "model.pt",
+    ]
+
+    for path in production_python_files(repo_dir):
+        text = read_text(path)
+        cleaned = _clean_python_for_detection(text)
+
+        has_artifact_signal = (
+            "wandb.artifact(" in cleaned
+            or re.search(r"\b\w*wandb\w*\.artifact\s*\(", cleaned)
+            or "log_artifact(" in cleaned
+            or "wandb.log_artifact(" in cleaned
+            or re.search(r"\b\w*wandb\w*\.log_artifact\s*\(", cleaned)
+            or re.search(r"\b\w*run\.log_artifact\s*\(", cleaned)
+        )
+        has_model_context = any(token in cleaned for token in model_context_tokens)
+        if has_artifact_signal and has_model_context:
+            evidence["wandb_model_artifact_logged"] = 1
+
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            continue
+
+        assignments = _collect_name_assignments(tree, text)
+        parent_map = _build_parent_map(tree)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _is_wandb_log_context(node):
+                is_main_file = path == main_path
+                call_context = _call_context_text(path, text, node, assignments, parent_map)
+
+                if _matches_any_pattern(call_context, metadata_patterns):
+                    evidence["wandb_run_metadata_logged"] = 1
+
+                if is_main_file:
+                    has_eval_namespace = _matches_any_pattern(call_context, eval_namespace_patterns)
+                    has_eval_metric_name = _matches_any_pattern(call_context, eval_metric_name_patterns)
+                    has_eval_context = _matches_any_pattern(call_context, eval_context_patterns)
+                    has_evaluate_model_assignment = "evaluate_model(" in call_context
+
+                    if has_eval_namespace or (has_eval_metric_name and has_eval_context) or has_evaluate_model_assignment:
+                        evidence["wandb_eval_metrics_logged"] = 1
+
+                if (
+                    not _is_config_gated_rich_tracking(node, parent_map, text)
+                    and (
+                    "wandb.table(" in call_context
+                    or "wandb.plot." in call_context
+                    or any(token in call_context for token in rich_eval_tokens)
+                    )
+                ):
+                    evidence["wandb_rich_eval_tracking_logged"] = 1
+
+            if isinstance(node, ast.Assign):
+                if any(isinstance(target, ast.Subscript) and _is_wandb_summary_context(target) for target in node.targets):
+                    summary_text = _node_text(text, node)
+                    if _matches_any_pattern(summary_text, metadata_patterns):
+                        evidence["wandb_run_metadata_logged"] = 1
+
+            if isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Subscript) and _is_wandb_summary_context(node.target):
+                    summary_text = _node_text(text, node)
+                    if _matches_any_pattern(summary_text, metadata_patterns):
+                        evidence["wandb_run_metadata_logged"] = 1
+
+            if isinstance(node, ast.Call):
+                call_text = _node_text(text, node)
+                if (
+                    not _is_config_gated_rich_tracking(node, parent_map, text)
+                    and ("wandb.table(" in call_text or "wandb.plot." in call_text)
+                ):
+                    evidence["wandb_rich_eval_tracking_logged"] = 1
+
+    return evidence
+
+
+def _attribute_chain_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _attribute_chain_name(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def _wandb_log_context_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Call):
+        return _attribute_chain_name(node.func).lower()
+    if isinstance(node, ast.Subscript):
+        return _attribute_chain_name(node.value).lower()
+    return _attribute_chain_name(node).lower()
+
+
+def _is_wandb_log_context(node: ast.AST) -> bool:
+    context_name = _wandb_log_context_name(node)
+    if not context_name.endswith(".log"):
+        return False
+    root = context_name.split(".", 1)[0]
+    return "wandb" in context_name or root == "run" or root.endswith("_run")
+
+
+def _is_wandb_summary_context(node: ast.AST) -> bool:
+    context_name = _wandb_log_context_name(node)
+    if not context_name.endswith(".summary"):
+        return False
+    root = context_name.split(".", 1)[0]
+    return "wandb" in context_name or root == "run" or root.endswith("_run")
+
+
+def _node_text(text: str, node: ast.AST | None) -> str:
+    if node is None:
+        return ""
+    return (ast.get_source_segment(text, node) or "").lower()
+
+
+def _collect_name_assignments(tree: ast.AST, text: str) -> dict[str, list[tuple[int, str]]]:
+    assignments: dict[str, list[tuple[int, str]]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            value_text = _node_text(text, node.value)
+            if not value_text:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append((node.lineno, value_text))
+        elif isinstance(node, ast.AnnAssign):
+            value_text = _node_text(text, node.value)
+            if value_text and isinstance(node.target, ast.Name):
+                assignments.setdefault(node.target.id, []).append((node.lineno, value_text))
+
+    for entries in assignments.values():
+        entries.sort(key=lambda item: item[0])
+    return assignments
+
+
+def _resolve_name_assignment(
+    name: str,
+    lineno: int,
+    assignments: dict[str, list[tuple[int, str]]],
+) -> str:
+    latest = ""
+    for assignment_lineno, assignment_text in assignments.get(name, []):
+        if assignment_lineno >= lineno:
+            break
+        latest = assignment_text
+    return latest
+
+
+def _build_parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    parent_map: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[child] = parent
+    return parent_map
+
+
+def _enclosing_function_name(node: ast.AST, parent_map: dict[ast.AST, ast.AST]) -> str:
+    current = parent_map.get(node)
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current.name.lower()
+        current = parent_map.get(current)
+    return ""
+
+
+def _is_config_gated_rich_tracking(
+    node: ast.AST,
+    parent_map: dict[ast.AST, ast.AST],
+    text: str,
+) -> bool:
+    current = parent_map.get(node)
+    while current is not None:
+        if isinstance(current, ast.If):
+            test_text = _node_text(text, current.test)
+            if "cfg" in test_text or "config" in test_text:
+                return True
+        current = parent_map.get(current)
+    return False
+
+
+def _call_context_text(
+    path: Path,
+    text: str,
+    node: ast.Call,
+    assignments: dict[str, list[tuple[int, str]]],
+    parent_map: dict[ast.AST, ast.AST],
+) -> str:
+    parts = [path.stem.lower(), _enclosing_function_name(node, parent_map), _node_text(text, node)]
+
+    if node.args and isinstance(node.args[0], ast.Name):
+        parts.append(_resolve_name_assignment(node.args[0].id, node.lineno, assignments))
+
+    for keyword in node.keywords:
+        if isinstance(keyword.value, ast.Name):
+            parts.append(_resolve_name_assignment(keyword.value.id, node.lineno, assignments))
+
+    return " ".join(part for part in parts if part)
+
+
+def _matches_any_pattern(text: str, patterns: list[str]) -> bool:
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def scan_config_reproducibility(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "config_yaml_present": 0,
+        "config_yaml_has_keys": 0,
+        "runtime_config_keys_found": 0,
+        "env_contract_signal": 0,
+        "gitignore_excludes_env": 0,
+        "conda_lock_yml_present": 0,
+        "main_reads_config_signal": 0,
+        "dotenv_usage_signal": 0,
+        "code_hardcoded_path_hits": 0,
+        "code_hardcoded_hyperparam_hits": 0,
+        "secret_like_literal_hits": 0,
+        "config_reproducibility_cap_reason": "",
+    }
+
+    config_candidates = [repo_dir / "config.yaml", repo_dir / "config.yml"]
+    config_path = next((path for path in config_candidates if path.exists()), None)
+    if config_path:
+        evidence["config_yaml_present"] = 1
+        try:
+            payload = yaml.safe_load(read_text(config_path))
+        except yaml.YAMLError:
+            payload = None
+
+        if isinstance(payload, dict) and payload:
+            evidence["config_yaml_has_keys"] = 1
+            evidence["runtime_config_keys_found"] = _count_yaml_leaf_keys(payload)
+
+    gitignore_path = repo_dir / ".gitignore"
+    if gitignore_path.exists():
+        gitignore_text = read_text(gitignore_path)
+        for raw_line in gitignore_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            if line in {".env", ".env*", "*.env"}:
+                evidence["gitignore_excludes_env"] = 1
+                break
+
+    evidence["conda_lock_yml_present"] = int(any(path.is_file() for path in repo_dir.rglob("conda-lock.yml")))
+
+    main_path = _find_main_path(repo_dir)
+    if main_path and main_path.exists():
+        main_text = read_text(main_path)
+        main_clean = _clean_python_for_detection(main_text)
+        if (
+            "yaml.safe_load" in main_clean
+            or re.search(r"\byaml\.load\s*\(", main_clean)
+            or re.search(r"\bopen\s*\([^\n]{0,120}config[^\n]{0,120}\)", main_clean)
+            or re.search(r"\bload_config\s*\(", main_clean)
+            or re.search(r"\bget_config\s*\(", main_clean)
+            or re.search(r"\bread_config\s*\(", main_clean)
+            or re.search(r"\bconfig\s*=\s*(?:yaml\.(?:safe_load|load)|load_config|get_config|read_config)\s*\(", main_clean)
+        ):
+            evidence["main_reads_config_signal"] = 1
+
+    runtime_owner_paths = set(runtime_owner_python_files(repo_dir))
+
+    for path in production_python_files(repo_dir):
+        text = read_text(path)
+        cleaned = _clean_python_for_detection(text)
+
+        if "load_dotenv(" in cleaned or re.search(r"\bos\.getenv\s*\(", cleaned):
+            evidence["dotenv_usage_signal"] += 1
+
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            evidence["secret_like_literal_hits"] += _secret_like_literal_hit_count(cleaned)
+            continue
+
+        evidence["secret_like_literal_hits"] += _secret_like_literal_hit_count(cleaned)
+
+        if path in runtime_owner_paths:
+            evidence["code_hardcoded_path_hits"] += _path_literal_hit_count(tree)
+            evidence["code_hardcoded_hyperparam_hits"] += _hyperparameter_hit_count(tree)
+
+    evidence["dotenv_usage_signal"] = int(evidence["dotenv_usage_signal"] > 0)
+    evidence["env_contract_signal"] = int(
+        evidence["gitignore_excludes_env"] and evidence["dotenv_usage_signal"]
+    )
+    return evidence
 
 def scan_validation_breadth(repo_dir: Path) -> dict[str, Any]:
     validation_paths = _validation_candidate_paths(repo_dir)
@@ -930,6 +2050,2864 @@ def scan_artifact_contract(repo_dir: Path) -> dict[str, Any]:
         "prediction_artifact_present": prediction_artifact_present,
         "structured_asset_paths_present": structured_asset_paths_present,
     }
+
+
+def _find_api_path(repo_dir: Path) -> Path | None:
+    candidates = [repo_dir / "api.py", repo_dir / "src" / "api.py"]
+    return next((path for path in candidates if path.exists()), None)
+
+
+def _repo_config_text(repo_dir: Path) -> str:
+    config_path = repo_dir / "config.yaml"
+    if not config_path.exists():
+        return ""
+    return read_text(config_path)
+
+
+def _repo_config_payload(repo_dir: Path) -> dict[str, Any]:
+    config_path = repo_dir / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        payload = yaml.safe_load(read_text(config_path)) or {}
+    except yaml.YAMLError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _module_reference_to_path(repo_dir: Path, module_name: str) -> Path | None:
+    cleaned = module_name.strip().lstrip(".")
+    if not cleaned:
+        return None
+    parts = cleaned.split(".")
+    if parts[0] == "src":
+        candidate = repo_dir.joinpath(*parts).with_suffix(".py")
+        if candidate.exists():
+            return candidate
+        if len(parts) > 1:
+            candidate = repo_dir.joinpath(*parts[1:]).with_suffix(".py")
+            if candidate.exists():
+                return candidate
+    candidate = repo_dir.joinpath(*parts).with_suffix(".py")
+    if candidate.exists():
+        return candidate
+    if (repo_dir / "src").exists():
+        candidate = repo_dir.joinpath("src", *parts).with_suffix(".py")
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _api_helper_paths(repo_dir: Path, api_path: Path) -> list[Path]:
+    try:
+        tree = ast.parse(read_text(api_path))
+    except SyntaxError:
+        return []
+
+    called_names: set[str] = set()
+    called_modules: set[str] = set()
+    import_map: dict[str, Path] = {}
+    module_alias_map: dict[str, Path] = {}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module_name = node.module or ""
+            if node.level and api_path.parent.name == "src" and not module_name.startswith("src"):
+                module_name = f"src.{module_name}" if module_name else "src"
+            module_path = _module_reference_to_path(repo_dir, module_name)
+            if not module_path:
+                continue
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                import_map[(alias.asname or alias.name).lower()] = module_path
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module_path = _module_reference_to_path(repo_dir, alias.name)
+                if not module_path:
+                    continue
+                module_alias_map[(alias.asname or alias.name.split(".")[-1]).lower()] = module_path
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called_names.add(func.id.lower())
+            elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                called_modules.add(func.value.id.lower())
+
+    helper_paths: list[Path] = []
+    for name, path in import_map.items():
+        if name in called_names and path not in helper_paths and path != api_path:
+            helper_paths.append(path)
+    for alias, path in module_alias_map.items():
+        if alias in called_modules and path not in helper_paths and path != api_path:
+            helper_paths.append(path)
+    return helper_paths
+
+
+def _registry_serving_signal(text: str) -> bool:
+    return bool(
+        re.search(r"\b\w+\.use_artifact\s*\(", text)
+        or re.search(r"\buse_artifact\s*\(", text)
+        or re.search(r"\b\w+\.artifact\s*\(", text)
+    )
+
+
+def _local_serving_signal(text: str) -> bool:
+    has_deserialize = bool(re.search(r"\b(?:joblib|pickle)\.load\s*\(", text))
+    if not has_deserialize:
+        return False
+    local_cues = [
+        "local_path",
+        "local_model_path",
+        "model_source=local",
+        "source == \"local\"",
+        "source == 'local'",
+        "loading model from local",
+        "using local model artifact",
+        "falling back to local",
+        "fallback to local",
+    ]
+    if any(cue in text for cue in local_cues):
+        return True
+    if re.search(r"os\.(?:getenv|environ\.get)\(\s*['\"]model_source['\"]\s*,\s*['\"]local['\"]\s*\)", text):
+        return True
+    return False
+
+
+def _prod_alias_signal(text: str, config_text: str) -> bool:
+    if ":prod" in text or re.search(r'["\']prod["\']', text):
+        return True
+    alias_used = bool(
+        re.search(r"\bartifact_(?:alias|ref(?:erence)?)\b", text)
+        or re.search(r"\balias\b", text)
+        or re.search(r"production_alias", text)
+        or re.search(r"artifact_alias", text)
+        or re.search(r"wandb_model_alias", text)
+    )
+    if not alias_used:
+        return False
+    return bool(re.search(r"(?im)^\s*(?:production_alias|artifact_alias)\s*:\s*[\"']?prod[\"']?\s*$", config_text))
+
+
+def _default_source_from_code_and_config(
+    combined_cleaned: str,
+    config_payload: dict[str, Any],
+) -> str | None:
+    inference_cfg = config_payload.get("inference")
+    if isinstance(inference_cfg, dict):
+        source = str(inference_cfg.get("source", "")).strip().lower()
+        if source in {"wandb", "local"}:
+            return source
+
+    default_patterns = [
+        r"os\.getenv\(\s*['\"]model_source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+        r"os\.environ\.get\(\s*['\"]model_source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+        r"getenv\(\s*['\"]model_source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+        r"get\(\s*['\"]source['\"]\s*,\s*['\"](wandb|local)['\"]\s*\)",
+    ]
+    for pattern in default_patterns:
+        match = re.search(pattern, combined_cleaned)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _strip_non_code_comments(text: str) -> str:
+    stripped_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line
+        if "#" in line:
+            line = line.split("#", 1)[0]
+        if line.strip():
+            stripped_lines.append(line)
+    return "\n".join(stripped_lines)
+
+
+def _api_candidate_paths(repo_dir: Path) -> list[Path]:
+    candidates = [repo_dir / "src" / "api.py", repo_dir / "api.py"]
+    return [path for path in candidates if path.exists()]
+
+
+def _load_api_module(repo_dir: Path) -> tuple[Path | None, ast.AST | None]:
+    for path in _api_candidate_paths(repo_dir):
+        try:
+            return path, ast.parse(read_text(path))
+        except SyntaxError:
+            continue
+    return None, None
+
+
+def _assigned_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _call_is_fastapi(node: ast.AST) -> bool:
+    return isinstance(node, ast.Call) and _call_name(node.func) == "FastAPI"
+
+
+def _function_returns_fastapi(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    fastapi_bound_names: set[str] = set()
+    for node in function_node.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            value = node.value if isinstance(node, ast.AnnAssign) else node.value
+            if value is None or not _call_is_fastapi(value):
+                continue
+            targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+            for target in targets:
+                assigned = _assigned_name(target)
+                if assigned:
+                    fastapi_bound_names.add(assigned)
+        elif isinstance(node, ast.Return):
+            if _call_is_fastapi(node.value):
+                return True
+            if isinstance(node.value, ast.Name) and node.value.id in fastapi_bound_names:
+                return True
+    return False
+
+
+def _fastapi_app_present(tree: ast.AST) -> bool:
+    create_app_returns_fastapi = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "create_app":
+            create_app_returns_fastapi = _function_returns_fastapi(node)
+            break
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "app" for target in node.targets):
+            continue
+        if _call_is_fastapi(node.value):
+            return True
+        if (
+            isinstance(node.value, ast.Call)
+            and _call_name(node.value.func) == "create_app"
+            and create_app_returns_fastapi
+        ):
+            return True
+    return False
+
+
+def _route_literal_matches(node: ast.Call, route_path: str) -> bool:
+    literal_args = [
+        arg.value
+        for arg in node.args
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+    ]
+    if route_path in literal_args:
+        return True
+    for keyword in node.keywords:
+        if keyword.arg == "path" and isinstance(keyword.value, ast.Constant) and keyword.value.value == route_path:
+            return True
+    return False
+
+
+def _route_decorator_matches(decorator: ast.AST, route_path: str) -> bool:
+    if not isinstance(decorator, ast.Call):
+        return False
+    if not isinstance(decorator.func, ast.Attribute):
+        return False
+    if not isinstance(decorator.func.value, ast.Name) or decorator.func.value.id != "app":
+        return False
+    if decorator.func.attr not in {"get", "post", "put", "patch", "delete", "route", "api_route"}:
+        return False
+    return _route_literal_matches(decorator, route_path)
+
+
+def _find_route_handlers(
+    tree: ast.AST,
+    route_path: str,
+) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    handlers: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(_route_decorator_matches(decorator, route_path) for decorator in node.decorator_list):
+            handlers.append(node)
+    return handlers
+
+
+def _base_model_subclass_names(tree: ast.AST) -> set[str]:
+    subclass_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            if isinstance(base, ast.Name) and base.id == "BaseModel":
+                subclass_names.add(node.name)
+            elif isinstance(base, ast.Attribute) and base.attr == "BaseModel":
+                subclass_names.add(node.name)
+    return subclass_names
+
+
+def _module_reference_to_local_path(repo_dir: Path, api_path: Path, module_name: str, level: int = 0) -> Path | None:
+    module = module_name.strip()
+    if level:
+        relative_parts = list(api_path.relative_to(repo_dir).parts[:-1])
+        if level <= len(relative_parts):
+            base_parts = relative_parts[: len(relative_parts) - level + 1]
+        else:
+            base_parts = []
+        if module:
+            parts = base_parts + module.split(".")
+        else:
+            parts = base_parts
+    else:
+        if not module:
+            return None
+        parts = module.split(".")
+
+    candidate = repo_dir.joinpath(*parts).with_suffix(".py")
+    if candidate.exists():
+        return candidate
+
+    package_init = repo_dir.joinpath(*parts, "__init__.py")
+    if package_init.exists():
+        return package_init
+    return None
+
+
+def _local_imported_base_model_names(repo_dir: Path, api_path: Path, tree: ast.AST) -> set[str]:
+    imported_model_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        module_path = _module_reference_to_local_path(repo_dir, api_path, node.module or "", node.level)
+        if module_path is None or module_path == api_path:
+            continue
+        try:
+            imported_tree = ast.parse(read_text(module_path))
+        except SyntaxError:
+            continue
+        available_base_models = _base_model_subclass_names(imported_tree)
+        if not available_base_models:
+            continue
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            exported_name = alias.name
+            local_name = alias.asname or alias.name
+            if exported_name in available_base_models:
+                imported_model_names.add(local_name)
+    return imported_model_names
+
+
+def _annotation_names(node: ast.AST | None) -> set[str]:
+    if node is None:
+        return set()
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return {node.attr}
+    if isinstance(node, ast.Subscript):
+        names = _annotation_names(node.value)
+        slice_node = node.slice
+        if isinstance(slice_node, ast.Tuple):
+            for elt in slice_node.elts:
+                names.update(_annotation_names(elt))
+        else:
+            names.update(_annotation_names(slice_node))
+        return names
+    if isinstance(node, ast.Tuple):
+        names: set[str] = set()
+        for elt in node.elts:
+            names.update(_annotation_names(elt))
+        return names
+    return set()
+
+
+def _predict_uses_pydantic_contract(
+    predict_handlers: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    base_model_names: set[str],
+) -> bool:
+    if not base_model_names:
+        return False
+    for handler in predict_handlers:
+        positional_args = list(handler.args.posonlyargs) + list(handler.args.args)
+        for arg in positional_args + list(handler.args.kwonlyargs):
+            names = _annotation_names(arg.annotation)
+            if names & base_model_names:
+                return True
+    return False
+
+
+def _infer_import_signals(tree: ast.AST) -> tuple[set[str], set[str]]:
+    infer_function_names: set[str] = set()
+    infer_module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module_name = (node.module or "").lower()
+            if "infer" not in module_name and "inference" not in module_name:
+                continue
+            for alias in node.names:
+                if alias.name != "*":
+                    infer_function_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module_name = alias.name.lower()
+                if "infer" in module_name or "inference" in module_name:
+                    infer_module_aliases.add(alias.asname or alias.name.split(".")[-1])
+    return infer_function_names, infer_module_aliases
+
+
+def _top_level_helper_names(tree: ast.AST) -> set[str]:
+    helper_names: set[str] = set()
+    if not isinstance(tree, ast.Module):
+        return helper_names
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            helper_names.add(node.name)
+    return helper_names
+
+
+def _imported_callable_names(tree: ast.AST) -> set[str]:
+    imported_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            imported_names.add(alias.asname or alias.name)
+    return imported_names
+
+
+def _imported_module_aliases(tree: ast.AST) -> set[str]:
+    module_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Import):
+            continue
+        for alias in node.names:
+            module_aliases.add(alias.asname or alias.name.split(".")[-1])
+    return module_aliases
+
+
+def _predict_calls_inference_logic(
+    predict_handlers: list[ast.FunctionDef | ast.AsyncFunctionDef],
+    local_helper_names: set[str],
+    imported_callable_names: set[str],
+    imported_module_aliases: set[str],
+    infer_function_names: set[str],
+    infer_module_aliases: set[str],
+) -> bool:
+    helper_name_pattern = re.compile(
+        r"(clean|validat|infer|predict|preprocess|prepare|transform|feature|serve|score|pipeline|model)",
+        flags=re.IGNORECASE,
+    )
+    excluded_helper_names = {
+        "jsonresponse",
+        "httpexception",
+        "dict",
+        "list",
+        "set",
+        "tuple",
+        "len",
+        "str",
+        "int",
+        "float",
+        "bool",
+        "print",
+    }
+
+    for handler in predict_handlers:
+        direct_model_call_found = False
+        delegated_helper_calls: set[str] = set()
+
+        for node in ast.walk(handler):
+            if not isinstance(node, ast.Call):
+                continue
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"predict", "predict_proba"}
+            ):
+                direct_model_call_found = True
+                continue
+
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+                if func_name in infer_function_names.union({"run_inference"}):
+                    delegated_helper_calls.add(func_name)
+                    continue
+
+                if (
+                    func_name in local_helper_names.union(imported_callable_names)
+                    and func_name.lower() not in excluded_helper_names
+                    and func_name != handler.name
+                ):
+                    delegated_helper_calls.add(func_name)
+                continue
+
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in infer_module_aliases.union(imported_module_aliases)
+            ):
+                helper_name = node.func.attr
+                if helper_name.lower() not in excluded_helper_names:
+                    delegated_helper_calls.add(helper_name)
+
+        if direct_model_call_found:
+            continue
+
+        if any(helper_name_pattern.search(name) for name in delegated_helper_calls):
+            return True
+        if len(delegated_helper_calls) >= 2:
+            return True
+    return False
+
+
+def _api_serving_signal_files(repo_dir: Path) -> list[Path]:
+    candidates = [
+        repo_dir / "Dockerfile",
+        repo_dir / "render.yaml",
+        repo_dir / "render.yml",
+        repo_dir / "Procfile",
+        repo_dir / "src" / "main.py",
+        repo_dir / "main.py",
+    ]
+    return [path for path in candidates if path.exists()]
+
+
+def _uvicorn_serving_present(repo_dir: Path) -> bool:
+    patterns = [
+        r"\buvicorn\s+(?:src\.api:app|api:app)\b",
+        r"[\[\(\{,\s\"']uvicorn[\"']\s*[, \]]+[\s\S]{0,200}[\"'](?:src\.api:app|api:app)[\"']",
+        r"\bconda\s+run\b[\s\S]{0,200}\buvicorn\b[\s\S]{0,200}\b(?:src\.api:app|api:app)\b",
+        r"\bgunicorn\b[\s\S]{0,200}\buvicorn\.workers\.[\w]+worker\b[\s\S]{0,200}\b(?:src\.api:app|api:app)\b",
+    ]
+    for path in _api_serving_signal_files(repo_dir):
+        if path.suffix == ".py":
+            try:
+                tree = ast.parse(read_text(path))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "uvicorn"
+                    and node.func.attr == "run"
+                ):
+                    return True
+            continue
+
+        stripped = _strip_non_code_comments(read_text(path))
+        if any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in patterns):
+            return True
+    return False
+
+
+def scan_api_serving(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "api_fastapi_app_present": 0,
+        "api_pydantic_contract_present": 0,
+        "api_health_endpoint_present": 0,
+        "api_predict_endpoint_present": 0,
+        "api_uvicorn_serving_present": 0,
+        "api_predict_calls_inference_logic": 0,
+        "api_serving_cap_reason": "",
+    }
+
+    api_path, tree = _load_api_module(repo_dir)
+    if api_path is None or tree is None:
+        evidence["api_uvicorn_serving_present"] = int(_uvicorn_serving_present(repo_dir))
+        evidence["api_serving_cap_reason"] = "no_fastapi_app"
+        return evidence
+
+    evidence["api_fastapi_app_present"] = int(_fastapi_app_present(tree))
+    health_handlers = _find_route_handlers(tree, "/health")
+    predict_handlers = _find_route_handlers(tree, "/predict")
+    evidence["api_health_endpoint_present"] = int(bool(health_handlers))
+    evidence["api_predict_endpoint_present"] = int(bool(predict_handlers))
+
+    base_model_names = _base_model_subclass_names(tree)
+    base_model_names.update(_local_imported_base_model_names(repo_dir, api_path, tree))
+    evidence["api_pydantic_contract_present"] = int(
+        _predict_uses_pydantic_contract(predict_handlers, base_model_names)
+    )
+
+    local_helper_names = _top_level_helper_names(tree)
+    imported_callable_names = _imported_callable_names(tree)
+    imported_module_aliases = _imported_module_aliases(tree)
+    infer_function_names, infer_module_aliases = _infer_import_signals(tree)
+    evidence["api_predict_calls_inference_logic"] = int(
+        _predict_calls_inference_logic(
+            predict_handlers,
+            local_helper_names,
+            imported_callable_names,
+            imported_module_aliases,
+            infer_function_names,
+            infer_module_aliases,
+        )
+    )
+    evidence["api_uvicorn_serving_present"] = int(_uvicorn_serving_present(repo_dir))
+
+    if not evidence["api_fastapi_app_present"]:
+        evidence["api_serving_cap_reason"] = "no_fastapi_app"
+    elif not evidence["api_predict_endpoint_present"]:
+        evidence["api_serving_cap_reason"] = "missing_predict_endpoint"
+    elif not evidence["api_predict_calls_inference_logic"]:
+        evidence["api_serving_cap_reason"] = "predict_without_inference_logic"
+
+    return evidence
+
+
+def _docker_instruction_lines(dockerfile_text: str, instruction: str) -> list[str]:
+    pattern = re.compile(rf"(?im)^\s*{instruction}\s+")
+    lines = dockerfile_text.splitlines()
+    instructions: list[str] = []
+    current: list[str] = []
+    collecting = False
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        if pattern.match(raw_line):
+            if current:
+                instructions.append(" ".join(current).strip())
+            current = [pattern.sub("", raw_line, count=1).strip()]
+            collecting = raw_line.rstrip().endswith("\\")
+            if not collecting:
+                instructions.append(" ".join(current).strip())
+                current = []
+            continue
+
+        if collecting:
+            current.append(stripped)
+            collecting = raw_line.rstrip().endswith("\\")
+            if not collecting:
+                instructions.append(" ".join(current).strip())
+                current = []
+
+    if current:
+        instructions.append(" ".join(current).strip())
+
+    return instructions
+
+
+def _docker_command_starts_serving(command_text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", command_text).strip()
+    if not cleaned:
+        return False
+
+    serving_patterns = [
+        r"\buvicorn\b.*\b(?:src\.api:app|api:app)\b",
+        r"\bgunicorn\b.*\b(?:src\.api:app|api:app)\b",
+        r"\bconda\s+run\b.*\buvicorn\b.*\b(?:src\.api:app|api:app)\b",
+    ]
+    return any(re.search(pattern, cleaned, flags=re.IGNORECASE) for pattern in serving_patterns)
+
+
+def _dockerfile_non_comment_text(dockerfile_text: str) -> str:
+    return "\n".join(
+        line for line in dockerfile_text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+def _dockerignore_noise_class_count(dockerignore_text: str) -> int:
+    patterns = {
+        "tests": [r"^tests?$"],
+        "notebooks": [r"^notebooks?$", r"^.*\.ipynb$"],
+        ".github": [r"^\.github$"],
+        "data": [r"^data$", r"^data/.*$"],
+        "reports": [r"^reports?$"],
+        "wandb": [r"^wandb$", r"^\.wandb$"],
+        "caches": [
+            r"^__pycache__$",
+            r"^\.pytest_cache$",
+            r"^\.mypy_cache$",
+            r"^\.ruff_cache$",
+        ],
+    }
+
+    matched_classes = 0
+    for class_patterns in patterns.values():
+        class_hit = False
+        for raw_line in dockerignore_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("!"):
+                continue
+            normalized = line.rstrip("/")
+            if any(re.fullmatch(pattern, normalized, flags=re.IGNORECASE) for pattern in class_patterns):
+                class_hit = True
+                break
+        if class_hit:
+            matched_classes += 1
+
+    return matched_classes
+
+
+def _dockerignore_strict_signal(dockerignore_text: str) -> int:
+    target_entries = {
+        "tests",
+        "notebooks",
+        ".github",
+        "data",
+        "reports",
+        "wandb",
+        ".pytest_cache",
+        "__pycache__",
+        "mlruns",
+        ".ruff_cache",
+        ".mypy_cache",
+    }
+
+    matched_entries: set[str] = set()
+    for raw_line in dockerignore_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        normalized = line.rstrip("/").lower()
+        if normalized in target_entries:
+            matched_entries.add(normalized)
+
+    return int(len(matched_entries) >= 4)
+
+
+def _docker_reproducible_install_signal(dockerfile_text: str) -> int:
+    non_comment_text = _dockerfile_non_comment_text(dockerfile_text)
+    lock_patterns = [
+        r"\bconda-lock\.yml\b",
+        r"\bpoetry\.lock\b",
+        r"\bPipfile\.lock\b",
+        r"\buv\.lock\b",
+        r"\brequirements(?:[-_.]lock(?:ed)?)\.(?:txt|in)\b",
+        r"\brequirements\.[^ \n\t\"']*lock[^ \n\t\"']*\.txt\b",
+    ]
+    return int(any(re.search(pattern, non_comment_text) for pattern in lock_patterns))
+
+
+def scan_containerization(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "dockerfile_present": 0,
+        "docker_serving_entrypoint_present": 0,
+        "dockerignore_present": 0,
+        "dockerignore_quality_signal": 0,
+        "docker_strict_dockerignore": 0,
+        "docker_reproducible_install_signal": 0,
+        "dockerignore_excluded_noise_count": 0,
+        "containerization_cap_reason": "",
+    }
+
+    dockerfile_path = repo_dir / "Dockerfile"
+    dockerignore_path = repo_dir / ".dockerignore"
+
+    if not dockerfile_path.exists():
+        return evidence
+
+    evidence["dockerfile_present"] = 1
+    dockerfile_text = read_text(dockerfile_path)
+
+    command_instructions = _docker_instruction_lines(dockerfile_text, "CMD")
+    command_instructions.extend(_docker_instruction_lines(dockerfile_text, "ENTRYPOINT"))
+    evidence["docker_serving_entrypoint_present"] = int(
+        any(_docker_command_starts_serving(command) for command in command_instructions)
+    )
+    evidence["docker_reproducible_install_signal"] = _docker_reproducible_install_signal(dockerfile_text)
+
+    if not dockerignore_path.exists():
+        return evidence
+
+    evidence["dockerignore_present"] = 1
+    dockerignore_text = read_text(dockerignore_path)
+    excluded_noise_count = _dockerignore_noise_class_count(dockerignore_text)
+    evidence["dockerignore_excluded_noise_count"] = excluded_noise_count
+    evidence["dockerignore_quality_signal"] = int(excluded_noise_count >= 6)
+    evidence["docker_strict_dockerignore"] = _dockerignore_strict_signal(dockerignore_text)
+
+    return evidence
+
+
+def _relative_repo_path(path: Path, repo_dir: Path) -> str:
+    try:
+        return path.relative_to(repo_dir).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _find_workflow_file(repo_dir: Path, kind: str) -> Path | None:
+    workflow_dir = repo_dir / ".github" / "workflows"
+    if not workflow_dir.exists():
+        return None
+
+    exact_candidates = {
+        "ci": ["ci.yml", "ci.yaml"],
+        "deploy": ["deploy.yml", "deploy.yaml"],
+    }
+    fallback_patterns = {
+        "ci": ["ci-*.yml", "ci_*.yml", "*-ci.yml"],
+        "deploy": ["deploy-*.yml", "deploy_*.yml"],
+    }
+
+    for name in exact_candidates[kind]:
+        candidate = workflow_dir / name
+        if candidate.exists():
+            return candidate
+
+    fallback_matches: list[Path] = []
+    for pattern in fallback_patterns[kind]:
+        fallback_matches.extend(sorted(workflow_dir.glob(pattern)))
+
+    return fallback_matches[0] if fallback_matches else None
+
+
+def _workflow_non_comment_text(workflow_text: str) -> str:
+    cleaned_lines: list[str] = []
+    for raw_line in workflow_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        before_inline_comment = raw_line.split(" #", 1)[0].rstrip()
+        if before_inline_comment.strip():
+            cleaned_lines.append(before_inline_comment)
+    return "\n".join(cleaned_lines)
+
+
+def _load_workflow_payload(workflow_path: Path) -> dict[str, Any] | None:
+    try:
+        payload = yaml.safe_load(read_text(workflow_path)) or {}
+    except yaml.YAMLError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _workflow_on_section(payload: dict[str, Any] | None) -> Any:
+    if not isinstance(payload, dict):
+        return None
+    if "on" in payload:
+        return payload["on"]
+    if True in payload:
+        return payload[True]
+    return None
+
+
+def _workflow_has_trigger(on_section: Any, trigger_name: str) -> bool:
+    if isinstance(on_section, str):
+        return on_section == trigger_name
+    if isinstance(on_section, list):
+        return any(item == trigger_name for item in on_section if isinstance(item, str))
+    if isinstance(on_section, dict):
+        return trigger_name in on_section
+    return False
+
+
+def _workflow_text_on_block(workflow_text: str) -> str:
+    on_match = re.search(r"(?ms)^\s*on\s*:\s*(.*?)(?=^\S|\Z)", workflow_text)
+    if on_match:
+        return on_match.group(1)
+    return workflow_text
+
+
+def _workflow_release_has_published_type(on_section: Any) -> bool:
+    if not isinstance(on_section, dict):
+        return False
+    release_section = on_section.get("release")
+    if isinstance(release_section, list):
+        return "published" in release_section
+    if isinstance(release_section, dict):
+        release_types = release_section.get("types")
+        if isinstance(release_types, str):
+            return release_types == "published"
+        if isinstance(release_types, list):
+            return any(item == "published" for item in release_types if isinstance(item, str))
+    return False
+
+
+def _workflow_text_has_trigger(workflow_text: str, trigger_name: str) -> bool:
+    on_block = _workflow_text_on_block(workflow_text)
+    return bool(re.search(rf"(?m)^\s*{re.escape(trigger_name)}\s*:", on_block))
+
+
+def _workflow_text_release_has_published_type(workflow_text: str) -> bool:
+    on_block = _workflow_text_on_block(workflow_text)
+    release_match = re.search(
+        r"(?ms)^\s*release\s*:\s*(.*?)(?=^\S|\Z)",
+        on_block,
+    )
+    if not release_match:
+        return False
+    release_block = release_match.group(1)
+    return bool(re.search(r"(?m)^\s*-\s*published\s*$", release_block))
+
+
+def _workflow_validation_step_hits(workflow_text: str) -> list[str]:
+    signal_patterns = [
+        ("python -m pytest", r"\bpython\s+-m\s+pytest\b"),
+        ("pytest", r"\bpytest\b"),
+        ("unittest", r"\bunittest\b"),
+        ("flake8", r"\bflake8\b"),
+        ("ruff", r"\bruff\b"),
+        ("pylint", r"\bpylint\b"),
+        ("coverage", r"\bcoverage\b"),
+    ]
+
+    hits: list[str] = []
+    for label, pattern in signal_patterns:
+        if re.search(pattern, workflow_text):
+            hits.append(label)
+    return hits
+
+
+def scan_ci_cd(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "ci_workflow_present": 0,
+        "ci_triggers_on_pr": 0,
+        "ci_runs_validation_steps": 0,
+        "cd_workflow_present": 0,
+        "cd_triggered_by_release_only": 0,
+        "cd_triggered_on_push_flag": 0,
+        "ci_workflow_file": "",
+        "cd_workflow_file": "",
+        "ci_validation_step_hits": "",
+        "ci_cd_cap_reason": "",
+    }
+
+    ci_workflow_path = _find_workflow_file(repo_dir, "ci")
+    if ci_workflow_path is not None:
+        evidence["ci_workflow_present"] = 1
+        evidence["ci_workflow_file"] = _relative_repo_path(ci_workflow_path, repo_dir)
+
+        ci_workflow_text = _workflow_non_comment_text(read_text(ci_workflow_path)).lower()
+        ci_payload = _load_workflow_payload(ci_workflow_path)
+        ci_on_section = _workflow_on_section(ci_payload)
+
+        if _workflow_has_trigger(ci_on_section, "pull_request") or _workflow_text_has_trigger(
+            ci_workflow_text, "pull_request"
+        ):
+            evidence["ci_triggers_on_pr"] = 1
+
+        validation_hits = _workflow_validation_step_hits(ci_workflow_text)
+        if validation_hits:
+            evidence["ci_runs_validation_steps"] = 1
+            evidence["ci_validation_step_hits"] = "|".join(validation_hits)
+
+    cd_workflow_path = _find_workflow_file(repo_dir, "deploy")
+    if cd_workflow_path is not None:
+        evidence["cd_workflow_present"] = 1
+        evidence["cd_workflow_file"] = _relative_repo_path(cd_workflow_path, repo_dir)
+
+        cd_workflow_text = _workflow_non_comment_text(read_text(cd_workflow_path)).lower()
+        cd_payload = _load_workflow_payload(cd_workflow_path)
+        cd_on_section = _workflow_on_section(cd_payload)
+
+        has_release_trigger = _workflow_has_trigger(cd_on_section, "release") or _workflow_text_has_trigger(
+            cd_workflow_text, "release"
+        )
+        has_published_type = _workflow_release_has_published_type(
+            cd_on_section
+        ) or _workflow_text_release_has_published_type(cd_workflow_text)
+        has_push_trigger = _workflow_has_trigger(cd_on_section, "push") or _workflow_text_has_trigger(
+            cd_workflow_text, "push"
+        )
+
+        evidence["cd_triggered_on_push_flag"] = int(has_push_trigger)
+        evidence["cd_triggered_by_release_only"] = int(
+            has_release_trigger and has_published_type and not has_push_trigger
+        )
+
+    return evidence
+
+
+def _monitoring_candidate_file(repo_dir: Path, relative_path: str) -> Path | None:
+    path = repo_dir / relative_path
+    return path if path.exists() else None
+
+
+def _monitoring_api_path(repo_dir: Path) -> Path | None:
+    for relative_path in ["src/api.py", "api.py"]:
+        path = _monitoring_candidate_file(repo_dir, relative_path)
+        if path is not None:
+            return path
+    return None
+
+
+def _monitoring_logger_path(repo_dir: Path) -> Path | None:
+    for relative_path in ["src/logger.py", "src/logging.py"]:
+        path = _monitoring_candidate_file(repo_dir, relative_path)
+        if path is not None:
+            return path
+    return None
+
+
+def _monitoring_read_text(path: Path | None) -> str:
+    if path is None or not path.exists():
+        return ""
+    return read_text(path)
+
+
+def _monitoring_config_payload(repo_dir: Path) -> dict[str, Any]:
+    config_path = _monitoring_candidate_file(repo_dir, "config.yaml")
+    if config_path is None:
+        return {}
+    try:
+        payload = yaml.safe_load(_monitoring_read_text(config_path)) or {}
+    except yaml.YAMLError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _monitoring_has_logfile_config(config_payload: dict[str, Any], config_text: str) -> bool:
+    configured_log_file = cfg_get(config_payload, "paths.log_file")
+    if isinstance(configured_log_file, str) and configured_log_file.strip():
+        return True
+    return bool(re.search(r"(?m)^\s*log_file\s*:\s*[\"']?.+\.log[\"']?\s*$", config_text))
+
+
+def _monitoring_logger_has_file_handler(logger_text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:FileHandler|RotatingFileHandler|TimedRotatingFileHandler)\b",
+            logger_text,
+        )
+    )
+
+
+def _monitoring_api_wires_logger(api_text: str, logger_path: Path | None) -> bool:
+    setup_patterns = [
+        r"\b(?:setup|configure)_logging\s*\(",
+        r"\blogging\.basicConfig\s*\(",
+    ]
+    if any(re.search(pattern, api_text) for pattern in setup_patterns):
+        return True
+
+    if logger_path is None:
+        return False
+
+    logger_module_stem = logger_path.stem
+    import_patterns = [
+        rf"\bfrom\s+\.?{re.escape(logger_module_stem)}\s+import\b",
+        rf"\bfrom\s+src\.{re.escape(logger_module_stem)}\s+import\b",
+        rf"\bimport\s+src\.{re.escape(logger_module_stem)}\b",
+        rf"\bimport\s+{re.escape(logger_module_stem)}\b",
+    ]
+    uses_runtime_logger_calls = bool(
+        re.search(r"\blogger\.(?:info|warning|error|exception|debug)\s*\(", api_text)
+    )
+    return any(re.search(pattern, api_text) for pattern in import_patterns) and uses_runtime_logger_calls
+
+
+def _monitoring_api_request_trace_signal(api_text: str) -> int:
+    trace_generation = bool(
+        re.search(
+            r"\b(?:correlation_id|request_id|trace_id)\s*=",
+            api_text,
+        )
+    )
+    trace_binding = bool(
+        re.search(
+            r"\brequest\.state\.(?:correlation_id|request_id|trace_id)\b",
+            api_text,
+        )
+        or re.search(
+            r"response\.headers\[\s*[\"']X-(?:Correlation|Request|Trace)-ID[\"']\s*\]",
+            api_text,
+        )
+        or re.search(
+            r"\b(?:correlation_id|request_id|trace_id)\s*=%s",
+            api_text,
+        )
+    )
+    return int(trace_generation and trace_binding)
+
+
+def _monitoring_api_logging_signal(api_text: str) -> int:
+    startup_shutdown_logging = bool(
+        re.search(
+            r"logger\.(?:info|warning|error|exception|debug)\s*\([^\n]*(?:startup|starting api|shutdown|shutting down)",
+            api_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    request_logging = bool(
+        re.search(
+            r"logger\.(?:info|warning|error|exception|debug)\s*\([^\n]*(?:path=|method=|latency|request|correlation_id)",
+            api_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    validation_error_logging = bool(
+        re.search(
+            r"logger\.(?:error|exception|warning)\s*\([^\n]*(?:validation error)",
+            api_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    prediction_error_logging = bool(
+        re.search(
+            r"logger\.(?:error|exception|warning)\s*\([^\n]*(?:prediction failed|inference failed|startup failed)",
+            api_text,
+            flags=re.IGNORECASE,
+        )
+    )
+    signal_count = sum(
+        [
+            startup_shutdown_logging,
+            request_logging,
+            validation_error_logging,
+            prediction_error_logging,
+        ]
+    )
+    return int(signal_count >= 2 or request_logging or prediction_error_logging)
+
+
+def _monitoring_wandb_inference_telemetry_signal(api_text: str) -> int:
+    has_runtime_wandb_logging = bool(
+        re.search(r"\bwandb\.init\s*\(", api_text)
+        or re.search(r"\bwandb\.log\s*\(", api_text)
+        or re.search(r"\bwandb\.Table\s*\(", api_text)
+    )
+    has_inference_context = bool(
+        re.search(r"\binference\b", api_text, flags=re.IGNORECASE)
+        or re.search(r"\bprediction\b", api_text, flags=re.IGNORECASE)
+        or re.search(r"\bcorrelation_id\b", api_text)
+        or re.search(r"\blatency_s\b", api_text)
+        or re.search(r"\bflush_logs_to_wandb\b", api_text)
+        or re.search(r"\binference_logs\b", api_text)
+        or re.search(r"job_type\s*=\s*[\"'][^\"']*inference", api_text, flags=re.IGNORECASE)
+    )
+    return int(has_runtime_wandb_logging and has_inference_context)
+
+
+def _monitoring_healthcheck_signal(api_text: str) -> int:
+    has_health_route = bool(
+        re.search(r"@app\.(?:get|api_route)\(\s*[\"']/health[\"']", api_text)
+        or re.search(r"[\"']/health[\"']", api_text)
+    )
+    has_operational_payload = bool(
+        re.search(r"\bstatus\b", api_text)
+        or re.search(r"\bmodel_loaded\b", api_text)
+        or re.search(r"\bmodel_version\b", api_text)
+        or re.search(r"\bmodel_source\b", api_text)
+    )
+    return int(has_health_route and has_operational_payload)
+
+
+def _monitoring_render_runtime_documented(readme_text: str, dockerfile_text: str) -> int:
+    readme_patterns = [
+        r"https://[^\s]+\.onrender\.com",
+        r"render",
+        r"/health",
+    ]
+    docker_patterns = [
+        r"\bHEALTHCHECK\b",
+        r"\bRender\b",
+        r"/health",
+    ]
+    readme_hit = all(re.search(pattern, readme_text, flags=re.IGNORECASE) for pattern in readme_patterns)
+    docker_hit = any(re.search(pattern, dockerfile_text, flags=re.IGNORECASE) for pattern in docker_patterns)
+    return int(readme_hit or docker_hit)
+
+
+def scan_monitoring(repo_dir: Path) -> dict[str, Any]:
+    evidence = {
+        "monitoring_local_runtime_log_signal": 0,
+        "monitoring_api_request_trace_signal": 0,
+        "monitoring_api_logging_signal": 0,
+        "monitoring_wandb_inference_telemetry_signal": 0,
+        "monitoring_healthcheck_signal": 0,
+        "monitoring_render_runtime_documented": 0,
+        "monitoring_cap_reason": "",
+    }
+
+    api_path = _monitoring_api_path(repo_dir)
+    logger_path = _monitoring_logger_path(repo_dir)
+    config_path = _monitoring_candidate_file(repo_dir, "config.yaml")
+    readme_path = _monitoring_candidate_file(repo_dir, "README.md")
+    dockerfile_path = _monitoring_candidate_file(repo_dir, "Dockerfile")
+    render_yaml_path = _monitoring_candidate_file(repo_dir, "render.yaml")
+    render_yml_path = _monitoring_candidate_file(repo_dir, "render.yml")
+
+    api_text = _monitoring_read_text(api_path)
+    logger_text = _monitoring_read_text(logger_path)
+    config_text = _monitoring_read_text(config_path)
+    readme_text = _monitoring_read_text(readme_path)
+    dockerfile_text = _monitoring_read_text(dockerfile_path)
+    render_text = _monitoring_read_text(render_yaml_path) + "\n" + _monitoring_read_text(render_yml_path)
+
+    config_payload = _monitoring_config_payload(repo_dir)
+    has_logfile_config = _monitoring_has_logfile_config(config_payload, config_text)
+    has_logger_file_handler = _monitoring_logger_has_file_handler(logger_text)
+    api_wires_logger = _monitoring_api_wires_logger(api_text, logger_path)
+
+    evidence["monitoring_local_runtime_log_signal"] = int(
+        has_logfile_config and has_logger_file_handler and api_wires_logger
+    )
+    evidence["monitoring_api_request_trace_signal"] = _monitoring_api_request_trace_signal(api_text)
+    evidence["monitoring_api_logging_signal"] = _monitoring_api_logging_signal(api_text)
+    evidence["monitoring_wandb_inference_telemetry_signal"] = (
+        _monitoring_wandb_inference_telemetry_signal(api_text)
+    )
+    evidence["monitoring_healthcheck_signal"] = _monitoring_healthcheck_signal(api_text)
+    evidence["monitoring_render_runtime_documented"] = _monitoring_render_runtime_documented(
+        readme_text + "\n" + render_text,
+        dockerfile_text,
+    )
+
+    return evidence
+
+
+def cutoff_datetime_utc(cutoff_str: str, timezone_name: str) -> datetime:
+    local_dt = datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=ZoneInfo(timezone_name)
+    )
+    return local_dt.astimezone(ZoneInfo("UTC"))
+
+
+def parse_github_datetime(timestamp: Any) -> datetime | None:
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def normalize_deployment_url(url: str) -> str:
+    raw = (url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return ""
+
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return ""
+
+    path = parts.path or ""
+    for suffix in ["/docs", "/health", "/predict"]:
+        if path == suffix or path.startswith(f"{suffix}/"):
+            path = ""
+            break
+
+    return urlunsplit((parts.scheme, parts.netloc, path.rstrip("/"), "", ""))
+
+
+def normalize_github_repo_url(repo_url: str) -> str:
+    raw = canonical_repo_url((repo_url or "").strip())
+    if not raw:
+        return ""
+
+    github_path = ""
+    if raw.startswith("https://github.com/"):
+        github_path = raw.removeprefix("https://github.com/")
+    elif raw.startswith("git@github.com:"):
+        github_path = raw.removeprefix("git@github.com:")
+    else:
+        return ""
+    github_path = github_path.strip("/")
+    parts = github_path.split("/")
+    if len(parts) != 2 or not all(parts):
+        return ""
+
+    owner, repo = parts
+    return f"https://github.com/{owner}/{repo}"
+
+
+def resolve_deployment_urls_file(deployment_urls_file: str | Path | None) -> Path:
+    if deployment_urls_file is None:
+        return (Path.cwd() / "deployment_urls.csv").resolve()
+    return Path(deployment_urls_file).expanduser().resolve()
+
+
+def load_deployment_urls(
+    deployment_urls_file: str | Path | None,
+) -> tuple[list[dict[str, str]], str]:
+    resolved_path = resolve_deployment_urls_file(deployment_urls_file)
+    if not resolved_path.exists():
+        return [], resolved_path.as_posix()
+
+    loaded_rows: list[dict[str, str]] = []
+    try:
+        with resolved_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                repo_id = str(row.get("repo_id", "")).strip()
+                normalized_repo_url = normalize_github_repo_url(
+                    str(row.get("repo_url", "")).strip()
+                )
+                normalized_url = normalize_deployment_url(str(row.get("render_url", "")).strip())
+                if normalized_url and (repo_id or normalized_repo_url):
+                    loaded_rows.append(
+                        {
+                            "repo_id": repo_id,
+                            "repo_url": normalized_repo_url,
+                            "render_url": normalized_url,
+                        }
+                    )
+    except OSError:
+        return [], resolved_path.as_posix()
+
+    return loaded_rows, resolved_path.as_posix()
+
+
+def _deployment_duplicate_legacy_repo_id(repo_id: str) -> str:
+    return f"{repo_id}_{repo_id}"
+
+
+def match_deployment_url(
+    repo_id: str,
+    repo_url: str,
+    deployment_url_rows: list[dict[str, str]],
+) -> tuple[str, str]:
+    stripped_repo_id = repo_id.strip()
+    normalized_repo_url = normalize_github_repo_url(repo_url)
+
+    for row in deployment_url_rows:
+        csv_repo_id = row["repo_id"]
+        if csv_repo_id == repo_id:
+            return row["render_url"], "exact"
+
+    for row in deployment_url_rows:
+        csv_repo_id = row["repo_id"]
+        if csv_repo_id.strip() == stripped_repo_id:
+            return row["render_url"], "stripped_exact"
+
+    duplicate_legacy_repo_id = _deployment_duplicate_legacy_repo_id(stripped_repo_id)
+    for row in deployment_url_rows:
+        csv_repo_id = row["repo_id"].strip()
+        if csv_repo_id == duplicate_legacy_repo_id:
+            return row["render_url"], "duplicate_legacy"
+
+    if normalized_repo_url:
+        for row in deployment_url_rows:
+            csv_repo_url = row.get("repo_url", "")
+            if csv_repo_url == normalized_repo_url:
+                return row["render_url"], "repo_url_exact"
+
+    return "", "missing"
+
+
+def _deployment_api_path(repo_dir: Path) -> Path | None:
+    for relative_path in ["src/api.py", "api.py"]:
+        candidate = repo_dir / relative_path
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _deployment_find_readme(repo_dir: Path) -> Path | None:
+    for name in ["README.md", "readme.md", "README.MD"]:
+        candidate = repo_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _deployment_text_excerpt(value: Any, limit: int = 200) -> str:
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=True)
+    else:
+        text = str(value or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _deployment_extract_json_block(text: str) -> tuple[str, str]:
+    curl_match = re.search(
+        r"curl[\s\S]{0,600}?/predict[\s\S]{0,1200}?-d\s+[\"'](\{[\s\S]*?\}|\[[\s\S]*?\])[\"']",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if curl_match:
+        return "readme_curl_example", curl_match.group(1)
+
+    python_match = re.search(
+        r"(?:requests|httpx)\.post[\s\S]{0,600}?/predict[\s\S]{0,1200}?json\s*=\s*(\{[\s\S]*?\}|\[[\s\S]*?\])",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if python_match:
+        return "readme_python_example", python_match.group(1)
+
+    predict_index = text.lower().find("/predict")
+    if predict_index == -1:
+        predict_index = text.lower().find("predict")
+    if predict_index != -1:
+        snippet = text[predict_index:predict_index + 3000]
+        fenced_match = re.search(r"```json\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", snippet, flags=re.IGNORECASE)
+        if fenced_match:
+            return "readme_curl_example", fenced_match.group(1)
+
+    return "missing", ""
+
+
+def _deployment_parse_json_like(value: str) -> Any | None:
+    raw = value.strip()
+    if not raw:
+        return None
+
+    candidates = [
+        raw,
+        raw.replace("'", "\""),
+    ]
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _deployment_model_paths_from_imports(api_path: Path, api_text: str) -> list[Path]:
+    paths: list[Path] = []
+    try:
+        tree = ast.parse(api_text)
+    except SyntaxError:
+        return paths
+
+    repo_root = api_path.parents[1] if api_path.parent.name == "src" else api_path.parent
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        module_name = node.module
+        if module_name.startswith("src."):
+            candidate = repo_root / Path(*module_name.split(".")).with_suffix(".py")
+        elif module_name == "schemas":
+            candidate = api_path.parent / "schemas.py"
+        else:
+            continue
+        if candidate.exists():
+            paths.append(candidate)
+
+    return paths
+
+
+def _deployment_parse_basemodels(text: str) -> dict[str, list[dict[str, Any]]]:
+    models: dict[str, list[dict[str, Any]]] = {}
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return models
+
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        if not any(safe_unparse(base).endswith("BaseModel") for base in node.bases):
+            continue
+
+        fields: list[dict[str, Any]] = []
+        for item in node.body:
+            if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
+                continue
+            annotation = safe_unparse(item.annotation).replace("typing.", "")
+            required = item.value is None or safe_unparse(item.value) == "..."
+            if isinstance(item.value, ast.Call) and safe_unparse(item.value.func).endswith("Field"):
+                if item.value.args and safe_unparse(item.value.args[0]) == "...":
+                    required = True
+            fields.append({"name": item.target.id, "annotation": annotation, "required": required})
+        models[node.name] = fields
+
+    return models
+
+
+def _deployment_collect_models(api_path: Path | None, api_text: str) -> dict[str, list[dict[str, Any]]]:
+    models = _deployment_parse_basemodels(api_text)
+    if api_path is None:
+        return models
+
+    for model_path in _deployment_model_paths_from_imports(api_path, api_text):
+        imported_models = _deployment_parse_basemodels(read_text(model_path))
+        for model_name, fields in imported_models.items():
+            models.setdefault(model_name, fields)
+
+    return models
+
+
+def _deployment_predict_annotation(api_text: str) -> str:
+    ignored_annotations = {"Request", "BackgroundTasks", "fastapi.Request"}
+    try:
+        tree = ast.parse(api_text)
+    except SyntaxError:
+        return ""
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any("/predict" in safe_unparse(decorator) for decorator in node.decorator_list):
+            continue
+        for arg in node.args.args:
+            annotation = safe_unparse(arg.annotation).replace("typing.", "")
+            if annotation and annotation not in ignored_annotations:
+                return annotation
+
+    return ""
+
+
+def _deployment_config_feature_fields(repo_dir: Path) -> list[str]:
+    config_path = repo_dir / "config.yaml"
+    if not config_path.exists():
+        return []
+    try:
+        payload = yaml.safe_load(read_text(config_path)) or {}
+    except yaml.YAMLError:
+        return []
+
+    feature_names: list[str] = []
+    features_cfg = payload.get("features", {}) if isinstance(payload, dict) else {}
+    for key in [
+        "numeric",
+        "numerical",
+        "categorical",
+        "quantile_cols",
+        "categorical_onehot",
+        "numeric_passthrough",
+    ]:
+        values = features_cfg.get(key)
+        if isinstance(values, list):
+            feature_names.extend(str(value) for value in values)
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in feature_names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def _deployment_annotation_sample(
+    annotation: str,
+    models: dict[str, list[dict[str, Any]]],
+    depth: int = 0,
+) -> tuple[Any | None, bool]:
+    normalized = annotation.replace("typing.", "").strip()
+    if not normalized:
+        return None, False
+
+    if normalized.startswith("Optional[") and normalized.endswith("]"):
+        return _deployment_annotation_sample(normalized[9:-1], models, depth)
+    if "|" in normalized and "None" in normalized:
+        parts = [part.strip() for part in normalized.split("|") if part.strip() != "None"]
+        if parts:
+            return _deployment_annotation_sample(parts[0], models, depth)
+
+    list_match = re.match(r"(?:List|list)\[(.+)\]$", normalized)
+    if list_match:
+        sample, valid = _deployment_annotation_sample(list_match.group(1), models, depth + 1)
+        return ([sample], True) if valid else (None, False)
+
+    lower = normalized.lower()
+    if lower == "str":
+        return "test", True
+    if lower == "int":
+        return 1, True
+    if lower == "float":
+        return 1.0, True
+    if lower == "bool":
+        return True, True
+
+    model_name = normalized.split(".")[-1]
+    if model_name in models and depth <= 1:
+        sample_dict: dict[str, Any] = {}
+        for field in models[model_name]:
+            if not field["required"]:
+                continue
+            sample, valid = _deployment_annotation_sample(field["annotation"], models, depth + 1)
+            if not valid:
+                return None, False
+            sample_dict[field["name"]] = sample
+        return sample_dict, bool(sample_dict)
+
+    return None, False
+
+
+def _deployment_payload_from_readme(readme_text: str) -> tuple[Any | None, str]:
+    source, payload_block = _deployment_extract_json_block(readme_text)
+    if source == "missing":
+        return None, "missing"
+    parsed_payload = _deployment_parse_json_like(payload_block)
+    return parsed_payload, source if parsed_payload is not None else "missing"
+
+
+def _deployment_payload_from_api(repo_dir: Path, api_path: Path | None, api_text: str) -> tuple[Any | None, str]:
+    if api_path is None or not api_text:
+        return None, "missing"
+
+    models = _deployment_collect_models(api_path, api_text)
+    annotation = _deployment_predict_annotation(api_text)
+    if not annotation:
+        return None, "missing"
+
+    top_level_match = re.match(r"(?:List|list)\[(.+)\]$", annotation)
+    if top_level_match:
+        sample, valid = _deployment_annotation_sample(annotation, models)
+        return (sample, "api_pydantic_model") if valid else (None, "missing")
+
+    request_model_name = annotation.split(".")[-1]
+    if request_model_name in models:
+        fields = models[request_model_name]
+        if len(fields) == 1:
+            wrapper_field = fields[0]
+            sample, valid = _deployment_annotation_sample(wrapper_field["annotation"], models)
+            if valid:
+                return ({wrapper_field["name"]: sample}, "api_pydantic_model")
+
+        sample, valid = _deployment_annotation_sample(annotation, models)
+        if valid:
+            return sample, "api_pydantic_model"
+
+    if "create_model" in api_text:
+        feature_fields = _deployment_config_feature_fields(repo_dir)
+        wrapper_match = re.search(
+            r"class\s+\w+\(BaseModel\):[\s\S]*?^\s*(\w+)\s*:\s*(?:List|list)\[",
+            api_text,
+            flags=re.MULTILINE,
+        )
+        if wrapper_match and feature_fields:
+            sample_record = {field: 1.0 for field in feature_fields}
+            return ({wrapper_match.group(1): [sample_record]}, "api_pydantic_model")
+
+    return None, "missing"
+
+
+def derive_deployment_payload(repo_dir: Path) -> tuple[Any | None, str]:
+    readme_path = _deployment_find_readme(repo_dir)
+    readme_text = read_text(readme_path) if readme_path else ""
+    payload, source = _deployment_payload_from_readme(readme_text)
+    if payload is not None:
+        return payload, source
+
+    api_path = _deployment_api_path(repo_dir)
+    api_text = read_text(api_path) if api_path else ""
+    payload, source = _deployment_payload_from_api(repo_dir, api_path, api_text)
+    if payload is not None:
+        return payload, source
+
+    return None, "missing"
+
+
+def _deployment_prediction_value_is_valid(value: Any) -> bool:
+    if isinstance(value, list):
+        return len(value) > 0
+    if isinstance(value, (int, float, bool)):
+        return True
+    if isinstance(value, dict):
+        return len(value) > 0
+    if isinstance(value, str):
+        sanitized = value.strip()
+        return bool(sanitized) and len(sanitized) <= 80
+    return False
+
+
+def _deployment_response_has_valid_prediction(response_json: Any) -> bool:
+    if isinstance(response_json, list):
+        return len(response_json) > 0
+
+    if not isinstance(response_json, dict) or not response_json:
+        return False
+
+    if "predictions" in response_json and isinstance(response_json["predictions"], list):
+        return len(response_json["predictions"]) > 0
+
+    for key in ["prediction", "predictions", "result", "results", "output", "outputs"]:
+        if key not in response_json:
+            continue
+        value = response_json[key]
+        if isinstance(value, str) and len(value.strip()) > 80:
+            return False
+        if _deployment_prediction_value_is_valid(value):
+            return True
+
+    return False
+
+
+def _deployment_resolve_openapi_ref(openapi_payload: dict[str, Any], ref: str) -> Any:
+    if not ref.startswith("#/"):
+        return None
+
+    current: Any = openapi_payload
+    for part in ref[2:].split("/"):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
+
+
+def _deployment_openapi_examples_value(examples_payload: Any) -> Any:
+    if not isinstance(examples_payload, dict):
+        return None
+    for example_payload in examples_payload.values():
+        if not isinstance(example_payload, dict):
+            continue
+        if "value" in example_payload:
+            return example_payload.get("value")
+        if "externalValue" in example_payload:
+            continue
+    return None
+
+
+def _deployment_resolve_openapi_schema_example(
+    schema_payload: Any,
+    openapi_payload: dict[str, Any],
+    seen_refs: set[str] | None = None,
+) -> Any:
+    if not isinstance(schema_payload, dict):
+        return None
+
+    if seen_refs is None:
+        seen_refs = set()
+
+    ref = schema_payload.get("$ref")
+    if isinstance(ref, str):
+        if ref in seen_refs:
+            return None
+        seen_refs.add(ref)
+        resolved = _deployment_resolve_openapi_ref(openapi_payload, ref)
+        return _deployment_resolve_openapi_schema_example(resolved, openapi_payload, seen_refs)
+
+    if "example" in schema_payload:
+        return schema_payload.get("example")
+
+    schema_examples = _deployment_openapi_examples_value(schema_payload.get("examples"))
+    if schema_examples is not None:
+        return schema_examples
+
+    properties = schema_payload.get("properties")
+    if isinstance(properties, dict):
+        built_example: dict[str, Any] = {}
+        for property_name, property_schema in properties.items():
+            property_example = _deployment_resolve_openapi_schema_example(
+                property_schema,
+                openapi_payload,
+                seen_refs=set(seen_refs),
+            )
+            if property_example is not None:
+                built_example[property_name] = property_example
+        if built_example:
+            return built_example
+
+    items_schema = schema_payload.get("items")
+    if isinstance(items_schema, dict):
+        item_example = _deployment_resolve_openapi_schema_example(
+            items_schema,
+            openapi_payload,
+            seen_refs=set(seen_refs),
+        )
+        if item_example is not None:
+            return [item_example]
+
+    return None
+
+
+def _deployment_extract_openapi_predict_example(
+    openapi_payload: dict[str, Any],
+) -> tuple[Any, str]:
+    paths_payload = openapi_payload.get("paths")
+    if not isinstance(paths_payload, dict):
+        return None, "no_openapi_example"
+
+    predict_payload = paths_payload.get("/predict")
+    if not isinstance(predict_payload, dict):
+        return None, "no_openapi_example"
+
+    for method in ("post", "put", "patch"):
+        operation_payload = predict_payload.get(method)
+        if not isinstance(operation_payload, dict):
+            continue
+        request_body = operation_payload.get("requestBody")
+        if not isinstance(request_body, dict):
+            continue
+        content_payload = request_body.get("content")
+        if not isinstance(content_payload, dict):
+            continue
+        json_media = content_payload.get("application/json")
+        if not isinstance(json_media, dict):
+            continue
+
+        if "example" in json_media:
+            return json_media.get("example"), "deployment_openapi_example"
+
+        media_examples = _deployment_openapi_examples_value(json_media.get("examples"))
+        if media_examples is not None:
+            return media_examples, "deployment_openapi_example"
+
+        schema_example = _deployment_resolve_openapi_schema_example(
+            json_media.get("schema"),
+            openapi_payload,
+        )
+        if schema_example is not None:
+            return schema_example, "deployment_openapi_example"
+
+    return None, "no_openapi_example"
+
+
+def derive_deployment_openapi_payload(
+    base_url: str,
+) -> tuple[Any, str, str]:
+    openapi_url = f"{base_url}/openapi.json"
+    try:
+        response = requests.get(openapi_url, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return None, "missing", _deployment_text_excerpt(str(exc))
+
+    try:
+        openapi_payload = response.json()
+    except ValueError as exc:
+        return None, "missing", _deployment_text_excerpt(str(exc))
+
+    example_payload, source = _deployment_extract_openapi_predict_example(openapi_payload)
+    if example_payload is None:
+        return None, "missing", source
+
+    if not isinstance(example_payload, (dict, list)):
+        return None, "missing", "openapi_example_unparseable"
+
+    return example_payload, source, ""
+
+
+def probe_deployment_predict_payload(
+    predict_url: str,
+    payload: Any,
+) -> dict[str, Any]:
+    result = {
+        "status_code": "",
+        "valid": 0,
+        "error": "",
+        "response_excerpt": "",
+        "response_json": None,
+    }
+
+    for backoff_seconds in [0, 5, 15]:
+        if backoff_seconds:
+            time.sleep(backoff_seconds)
+        try:
+            response = requests.post(predict_url, json=payload, timeout=20)
+        except requests.Timeout:
+            result["error"] = "Timed out after 20s"
+            continue
+        except requests.RequestException as exc:
+            result["error"] = _deployment_text_excerpt(str(exc))
+            continue
+
+        result["status_code"] = response.status_code
+        result["response_excerpt"] = _deployment_text_excerpt(response.text)
+        if response.status_code != 200:
+            result["error"] = _deployment_text_excerpt(response.text or f"HTTP {response.status_code}")
+            continue
+
+        try:
+            response_json = response.json()
+            result["response_json"] = response_json
+        except ValueError as exc:
+            result["error"] = _deployment_text_excerpt(str(exc))
+            continue
+
+        if _deployment_response_has_valid_prediction(response_json):
+            result["valid"] = 1
+            result["error"] = ""
+            return result
+
+        result["error"] = _deployment_text_excerpt(response_json)
+
+    return result
+
+
+def probe_deployment_predict_payload_once(
+    predict_url: str,
+    payload: Any,
+) -> dict[str, Any]:
+    result = {
+        "status_code": "",
+        "valid": 0,
+        "error": "",
+        "response_excerpt": "",
+        "response_json": None,
+    }
+
+    try:
+        response = requests.post(predict_url, json=payload, timeout=20)
+    except requests.Timeout:
+        result["error"] = "Timed out after 20s"
+        return result
+    except requests.RequestException as exc:
+        result["error"] = _deployment_text_excerpt(str(exc))
+        return result
+
+    result["status_code"] = response.status_code
+    result["response_excerpt"] = _deployment_text_excerpt(response.text)
+    if response.status_code != 200:
+        result["error"] = _deployment_text_excerpt(response.text or f"HTTP {response.status_code}")
+        try:
+            result["response_json"] = response.json()
+        except ValueError:
+            pass
+        return result
+
+    try:
+        response_json = response.json()
+        result["response_json"] = response_json
+    except ValueError as exc:
+        result["error"] = _deployment_text_excerpt(str(exc))
+        return result
+
+    if _deployment_response_has_valid_prediction(response_json):
+        result["valid"] = 1
+        return result
+
+    result["error"] = _deployment_text_excerpt(response_json)
+    return result
+
+
+def _deployment_is_integer_number(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _deployment_parse_numeric_value(raw_value: Any) -> float | None:
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        return float(raw_value)
+    if not isinstance(raw_value, str):
+        return None
+    try:
+        return float(raw_value.strip())
+    except ValueError:
+        return None
+
+
+def _deployment_number_from_constraint(value: float, prefer_integer: bool) -> float | int:
+    if prefer_integer and float(value).is_integer():
+        return int(value)
+    return float(value)
+
+
+def _deployment_repaired_numeric_value(
+    current_value: Any,
+    constraint: dict[str, Any],
+) -> float | int | None:
+    prefer_integer = _deployment_is_integer_number(current_value)
+    constraint_kind = constraint.get("kind")
+
+    if constraint_kind == "minimum":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        return _deployment_number_from_constraint(parsed, prefer_integer)
+
+    if constraint_kind == "maximum":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        return _deployment_number_from_constraint(parsed, prefer_integer)
+
+    if constraint_kind == "gt":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        if prefer_integer:
+            return int(parsed) + 1
+        return float(parsed) + 1.0
+
+    if constraint_kind == "lt":
+        parsed = _deployment_parse_numeric_value(constraint.get("value"))
+        if parsed is None:
+            return None
+        if prefer_integer:
+            return int(parsed) - 1
+        return float(parsed) - 1.0
+
+    if constraint_kind == "between":
+        lower = _deployment_parse_numeric_value(constraint.get("lower"))
+        upper = _deployment_parse_numeric_value(constraint.get("upper"))
+        if lower is None or upper is None:
+            return None
+        midpoint = (lower + upper) / 2.0
+        if prefer_integer:
+            midpoint_value = int(round(midpoint))
+            return max(int(lower), min(int(upper), midpoint_value))
+        return max(lower, min(upper, midpoint))
+
+    return None
+
+
+def _deployment_runtime_error_text(error_text: str) -> bool:
+    lowered = error_text.lower()
+    runtime_markers = [
+        "traceback",
+        "attributeerror",
+        "typeerror",
+        "valueerror",
+        "exception",
+        "transform",
+        "predict",
+        "model",
+        "internal server error",
+        "has no attribute",
+    ]
+    return any(marker in lowered for marker in runtime_markers)
+
+
+def _deployment_docs_error_is_runtime_like(docs_probe: dict[str, Any]) -> bool:
+    status_code = str(docs_probe.get("status_code", "")).strip()
+    if status_code and status_code.isdigit() and int(status_code) >= 500:
+        return True
+
+    error_text = str(docs_probe.get("error", "")).strip()
+    excerpt_text = str(docs_probe.get("response_excerpt", "")).strip()
+    if _deployment_runtime_error_text(error_text) or _deployment_runtime_error_text(excerpt_text):
+        return True
+
+    response_json = docs_probe.get("response_json")
+    if isinstance(response_json, dict):
+        detail_payload = response_json.get("detail")
+        if isinstance(detail_payload, str) and _deployment_runtime_error_text(detail_payload):
+            return True
+
+    return False
+
+
+def _deployment_docs_error_is_validation_like(docs_probe: dict[str, Any]) -> bool:
+    status_code = str(docs_probe.get("status_code", "")).strip()
+    if status_code == "422":
+        return True
+
+    response_json = docs_probe.get("response_json")
+    if isinstance(response_json, dict):
+        detail_payload = response_json.get("detail")
+        if isinstance(detail_payload, list):
+            return True
+
+    error_text = str(docs_probe.get("error", "")).lower()
+    return "validation" in error_text or "minimum" in error_text or "between" in error_text
+
+
+def _deployment_constraint_from_text(message_text: str) -> dict[str, Any] | None:
+    between_match = re.search(
+        r"between\s+(-?\d+(?:\.\d+)?)\s+and\s+(-?\d+(?:\.\d+)?)",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if between_match:
+        return {
+            "kind": "between",
+            "lower": float(between_match.group(1)),
+            "upper": float(between_match.group(2)),
+        }
+
+    minimum_match = re.search(
+        r"(?:below\s+minimum|min(?:imum)?|greater than or equal to|ge)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if minimum_match:
+        return {"kind": "minimum", "value": float(minimum_match.group(1))}
+
+    maximum_match = re.search(
+        r"(?:above\s+maximum|max(?:imum)?|less than or equal to|le)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if maximum_match:
+        return {"kind": "maximum", "value": float(maximum_match.group(1))}
+
+    gt_match = re.search(
+        r"(?:greater than|gt)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if gt_match:
+        return {"kind": "gt", "value": float(gt_match.group(1))}
+
+    lt_match = re.search(
+        r"(?:less than|lt)\s*\(?\s*(-?\d+(?:\.\d+)?)\s*\)?",
+        message_text,
+        flags=re.IGNORECASE,
+    )
+    if lt_match:
+        return {"kind": "lt", "value": float(lt_match.group(1))}
+
+    return None
+
+
+def _deployment_field_from_text(message_text: str) -> str:
+    field_match = re.search(r"[\"'`](?P<field>[A-Za-z0-9_.-]+)[\"'`]", message_text)
+    if field_match:
+        return field_match.group("field")
+    return ""
+
+
+def _deployment_parse_string_detail_errors(detail_str: str) -> list[tuple[str, str]]:
+    """
+    Parse custom string validation detail into (field_name, message_text) pairs.
+
+    Handles both:
+    - single-line strings like:
+      "Data validation found 1 issue(s): - 'days': must be at least 1"
+    - multi-line strings like:
+      "Data validation found 2 issue(s):\n  - 'duration_days': 1 values below minimum (1)\n  - 'traveler_age': 1 values below minimum (1)"
+
+    Returns empty list if nothing parseable.
+    """
+    parsed_errors: list[tuple[str, str]] = []
+    pattern = re.compile(
+        r"-\s+['\"]([A-Za-z0-9_.-]+)['\"]\s*:\s*(.*?)(?=\s+-\s+['\"]|$)",
+        flags=re.DOTALL,
+    )
+    for match in pattern.finditer(str(detail_str)):
+        field_name = match.group(1).strip()
+        message_text = match.group(2).strip()
+        if field_name and message_text:
+            parsed_errors.append((field_name, message_text))
+    return parsed_errors
+
+
+def _deployment_constraint_from_validation_entry(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+
+    entry_type = str(entry.get("type", "")).strip()
+    ctx = entry.get("ctx") if isinstance(entry.get("ctx"), dict) else {}
+    if entry_type in {"greater_than_equal", "ge", "greater_than_equal_validator"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("ge"))
+        if parsed is not None:
+            return {"kind": "minimum", "value": parsed}
+    if entry_type in {"less_than_equal", "le", "less_than_equal_validator"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("le"))
+        if parsed is not None:
+            return {"kind": "maximum", "value": parsed}
+    if entry_type in {"greater_than", "gt"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("gt"))
+        if parsed is not None:
+            return {"kind": "gt", "value": parsed}
+    if entry_type in {"less_than", "lt"}:
+        parsed = _deployment_parse_numeric_value(ctx.get("lt"))
+        if parsed is not None:
+            return {"kind": "lt", "value": parsed}
+
+    message_text = str(entry.get("msg", "")).strip()
+    return _deployment_constraint_from_text(message_text)
+
+
+def _deployment_loc_path_from_validation_entry(entry: Any) -> list[Any]:
+    if not isinstance(entry, dict):
+        return []
+
+    loc = entry.get("loc")
+    if not isinstance(loc, (list, tuple)):
+        return []
+
+    normalized_loc = [part for part in loc if part != "body"]
+    return normalized_loc
+
+
+def _deployment_find_key_paths(payload: Any, target_key: str, current_path: list[Any] | None = None) -> list[list[Any]]:
+    if current_path is None:
+        current_path = []
+
+    found_paths: list[list[Any]] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            next_path = current_path + [key]
+            if key == target_key:
+                found_paths.append(next_path)
+            found_paths.extend(_deployment_find_key_paths(value, target_key, next_path))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            found_paths.extend(_deployment_find_key_paths(value, target_key, current_path + [index]))
+    return found_paths
+
+
+def _deployment_get_nested_value(payload: Any, path: list[Any]) -> Any:
+    current = payload
+    for part in path:
+        if isinstance(current, dict) and isinstance(part, str) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            current = current[part]
+        else:
+            return None
+    return current
+
+
+def _deployment_set_nested_value(payload: Any, path: list[Any], value: Any) -> bool:
+    if not path:
+        return False
+
+    current = payload
+    for part in path[:-1]:
+        if isinstance(current, dict) and isinstance(part, str) and part in current:
+            current = current[part]
+            continue
+        if isinstance(current, list) and isinstance(part, int) and 0 <= part < len(current):
+            current = current[part]
+            continue
+        return False
+
+    last_part = path[-1]
+    if isinstance(current, dict) and isinstance(last_part, str) and last_part in current:
+        current[last_part] = value
+        return True
+    if isinstance(current, list) and isinstance(last_part, int) and 0 <= last_part < len(current):
+        current[last_part] = value
+        return True
+    return False
+
+
+def _deployment_repair_numeric_docs_example(
+    docs_payload: Any,
+    docs_probe: dict[str, Any],
+) -> tuple[Any, str]:
+    if _deployment_docs_error_is_runtime_like(docs_probe):
+        return None, "non_repairable_runtime_error"
+
+    if not _deployment_docs_error_is_validation_like(docs_probe):
+        return None, "non_repairable_validation_error"
+
+    repaired_payload = json.loads(json.dumps(docs_payload))
+    response_json = docs_probe.get("response_json")
+    repair_actions: list[tuple[list[Any], dict[str, Any], str]] = []
+
+    if isinstance(response_json, dict) and isinstance(response_json.get("detail"), list):
+        for entry in response_json.get("detail", []):
+            constraint = _deployment_constraint_from_validation_entry(entry)
+            if constraint is None:
+                continue
+            loc_path = _deployment_loc_path_from_validation_entry(entry)
+            field_name = _deployment_field_from_text(str(entry.get("msg", "")).strip())
+            repair_actions.append((loc_path, constraint, field_name))
+    elif isinstance(response_json, dict) and isinstance(response_json.get("detail"), str):
+        for field_name, message_text in _deployment_parse_string_detail_errors(response_json.get("detail", "")):
+            constraint = _deployment_constraint_from_text(message_text)
+            if constraint is None:
+                continue
+            candidate_paths = _deployment_find_key_paths(repaired_payload, field_name)
+            if len(candidate_paths) == 1:
+                repair_actions.append((candidate_paths[0], constraint, field_name))
+
+    if not repair_actions:
+        error_text = str(docs_probe.get("error", "")).strip()
+        excerpt_text = str(docs_probe.get("response_excerpt", "")).strip()
+        combined_text = f"{error_text} {excerpt_text}".strip()
+        constraint = _deployment_constraint_from_text(combined_text)
+        field_name = _deployment_field_from_text(combined_text)
+        if constraint is None:
+            return None, "no_numeric_constraint_found"
+        repair_actions.append(([], constraint, field_name))
+
+    applied_any = False
+    for loc_path, constraint, field_name in repair_actions:
+        target_path = list(loc_path)
+        if not target_path and field_name:
+            candidate_paths = _deployment_find_key_paths(repaired_payload, field_name)
+            if len(candidate_paths) == 1:
+                target_path = candidate_paths[0]
+
+        current_value = _deployment_get_nested_value(repaired_payload, target_path) if target_path else None
+        if current_value is None:
+            continue
+        if not isinstance(current_value, (int, float)) or isinstance(current_value, bool):
+            continue
+
+        repaired_value = _deployment_repaired_numeric_value(current_value, constraint)
+        if repaired_value is None:
+            continue
+        if _deployment_set_nested_value(repaired_payload, target_path, repaired_value):
+            applied_any = True
+
+    if not applied_any:
+        return None, "numeric_constraint_not_applied"
+
+    return repaired_payload, "numeric_bounds_repaired"
+
+
+def _deployment_missing_required_entries(response_json: Any) -> list[dict[str, Any]]:
+    if not isinstance(response_json, dict):
+        return []
+    detail_payload = response_json.get("detail")
+    if not isinstance(detail_payload, list):
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for entry in detail_payload:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = str(entry.get("type", "")).strip().lower()
+        entry_msg = str(entry.get("msg", "")).strip().lower()
+        if entry_type == "missing" or "field required" in entry_msg or "missing" in entry_msg:
+            entries.append(entry)
+    return entries
+
+
+def _deployment_normalize_alias_tokens(field_name: str) -> list[str]:
+    raw_tokens = [token for token in re.split(r"[^a-zA-Z0-9]+", field_name.lower()) if token]
+    normalized_tokens: list[str] = []
+    for token in raw_tokens:
+        normalized_tokens.append(re.sub(r"(.)\1+", r"\1", token))
+    return normalized_tokens
+
+
+def _deployment_token_subsequence_present(haystack: list[str], needle: list[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    for start_index in range(len(haystack) - len(needle) + 1):
+        if haystack[start_index:start_index + len(needle)] == needle:
+            return True
+    return False
+
+
+def _deployment_find_required_field_alias_key(
+    payload_object: Any,
+    missing_field: str,
+) -> tuple[str, str]:
+    if not isinstance(payload_object, dict):
+        return "", "required_field_alias_not_found"
+
+    missing_tokens = _deployment_normalize_alias_tokens(missing_field)
+    if not missing_tokens:
+        return "", "required_field_alias_not_found"
+
+    strong_candidates: list[str] = []
+    for candidate_key in payload_object.keys():
+        if not isinstance(candidate_key, str) or candidate_key == missing_field:
+            continue
+        candidate_tokens = _deployment_normalize_alias_tokens(candidate_key)
+        if not candidate_tokens:
+            continue
+
+        if candidate_tokens == missing_tokens:
+            strong_candidates.append(candidate_key)
+            continue
+
+        token_count = len(missing_tokens)
+        if candidate_tokens[:token_count] == missing_tokens or candidate_tokens[-token_count:] == missing_tokens:
+            strong_candidates.append(candidate_key)
+            continue
+
+        if _deployment_token_subsequence_present(candidate_tokens, missing_tokens):
+            strong_candidates.append(candidate_key)
+
+    unique_candidates = sorted(set(strong_candidates))
+    if len(unique_candidates) == 1:
+        return unique_candidates[0], "required_field_alias_copy"
+    if len(unique_candidates) > 1:
+        return "", "required_field_alias_not_unique"
+    return "", "required_field_alias_not_found"
+
+
+def _deployment_repair_missing_required_field_aliases(
+    fallback_payload: Any,
+    fallback_probe: dict[str, Any],
+) -> tuple[Any, str, int]:
+    if _deployment_docs_error_is_runtime_like(fallback_probe):
+        return None, "non_repairable_runtime_error", 0
+
+    missing_entries = _deployment_missing_required_entries(fallback_probe.get("response_json"))
+    if not missing_entries:
+        return None, "required_field_alias_not_found", 0
+
+    repaired_payload = json.loads(json.dumps(fallback_payload))
+    applied_any = False
+    saw_ambiguous = False
+
+    for entry in missing_entries:
+        loc_path = _deployment_loc_path_from_validation_entry(entry)
+        if not loc_path:
+            continue
+        object_path = loc_path[:-1]
+        if not object_path:
+            continue
+        missing_field = str(loc_path[-1]).strip()
+        if not missing_field:
+            continue
+
+        target_object = _deployment_get_nested_value(repaired_payload, object_path)
+        alias_key, alias_reason = _deployment_find_required_field_alias_key(target_object, missing_field)
+        if alias_reason == "required_field_alias_not_unique":
+            saw_ambiguous = True
+            continue
+        if not alias_key or not isinstance(target_object, dict) or alias_key not in target_object:
+            continue
+
+        target_object[missing_field] = target_object[alias_key]
+        applied_any = True
+
+    if applied_any:
+        return repaired_payload, "required_field_alias_copy", 1
+    if saw_ambiguous:
+        return None, "required_field_alias_not_unique", 1
+    return None, "required_field_alias_not_found", 1
+
+
+def scan_deployment(
+    repo_dir: Path,
+    repo: RepoSpec,
+    deployment_urls_file: str | Path | None = None,
+) -> dict[str, Any]:
+    evidence = {
+        "deployment_public_url_present": 0,
+        "deployment_service_reachable": 0,
+        "deployment_predict_accepts_valid_json": 0,
+        "deployment_valid_prediction_response": 0,
+        "deployment_docs_example_present": 0,
+        "deployment_docs_example_source": "missing",
+        "deployment_docs_example_predict_status_code": "",
+        "deployment_docs_example_valid": 0,
+        "deployment_docs_example_error": "",
+        "deployment_docs_example_repair_attempted": 0,
+        "deployment_docs_example_repair_applied": 0,
+        "deployment_docs_example_repair_reason": "",
+        "deployment_missing_field_repair_attempted": 0,
+        "deployment_missing_field_repair_succeeded": 0,
+        "deployment_missing_field_repair_reason": "",
+        "deployment_missing_field_repaired_status_code": "",
+        "deployment_composed_fallback_repair_attempted": 0,
+        "deployment_composed_fallback_repair_succeeded": 0,
+        "deployment_composed_fallback_repair_reason": "",
+        "deployment_fallback_payload_source": "",
+        "deployment_live_payload_strategy": "",
+        "deployment_docs_penalty_reason": "",
+        "deployment_repo_id_used": repo.repo_id,
+        "deployment_url_file_used": "",
+        "deployment_url_match_mode": "missing",
+        "deployment_base_url": "",
+        "deployment_predict_url": "",
+        "deployment_health_url": "",
+        "deployment_healthcheck_ok": 0,
+        "deployment_health_status_code": "",
+        "deployment_predict_status_code": "",
+        "deployment_timeout_flag": 0,
+        "deployment_retry_count": 0,
+        "deployment_payload_source": "missing",
+        "deployment_response_excerpt": "",
+        "deployment_error_message": "",
+        "deployment_checked_at_utc": "",
+    }
+
+    deployment_url_rows, resolved_url_file = load_deployment_urls(deployment_urls_file)
+    evidence["deployment_url_file_used"] = resolved_url_file
+    matched_url, match_mode = match_deployment_url(
+        repo.repo_id,
+        repo.repo_url,
+        deployment_url_rows,
+    )
+    evidence["deployment_url_match_mode"] = match_mode
+    base_url = normalize_deployment_url(matched_url)
+    if not base_url:
+        return evidence
+
+    evidence["deployment_public_url_present"] = 1
+    evidence["deployment_base_url"] = base_url
+    evidence["deployment_predict_url"] = f"{base_url}/predict"
+    evidence["deployment_health_url"] = f"{base_url}/health"
+    evidence["deployment_checked_at_utc"] = (
+        datetime.now(ZoneInfo("UTC")).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+
+    docs_payload, docs_payload_source, docs_payload_error = derive_deployment_openapi_payload(base_url)
+    evidence["deployment_docs_example_source"] = docs_payload_source
+    repaired_docs_payload = None
+    if docs_payload is not None:
+        evidence["deployment_docs_example_present"] = 1
+        docs_probe = probe_deployment_predict_payload(evidence["deployment_predict_url"], docs_payload)
+        evidence["deployment_docs_example_predict_status_code"] = docs_probe["status_code"]
+        evidence["deployment_docs_example_valid"] = docs_probe["valid"]
+        evidence["deployment_docs_example_error"] = docs_probe["error"]
+        if docs_probe["valid"] != 1:
+            repaired_docs_payload, repair_reason = _deployment_repair_numeric_docs_example(
+                docs_payload,
+                docs_probe,
+            )
+            evidence["deployment_docs_example_repair_reason"] = repair_reason
+            if repaired_docs_payload is not None:
+                evidence["deployment_docs_example_repair_attempted"] = 1
+                repaired_probe = probe_deployment_predict_payload(
+                    evidence["deployment_predict_url"],
+                    repaired_docs_payload,
+                )
+                if repaired_probe["valid"] == 1:
+                    evidence["deployment_docs_example_repair_applied"] = 1
+    elif docs_payload_error:
+        evidence["deployment_docs_example_error"] = docs_payload_error
+
+    fallback_payload, fallback_payload_source = derive_deployment_payload(repo_dir)
+    if fallback_payload is None:
+        fallback_payload = {}
+        fallback_payload_source = "empty_fallback"
+
+    payload = fallback_payload
+    payload_source = fallback_payload_source
+    evidence["deployment_fallback_payload_source"] = ""
+    if evidence["deployment_docs_example_valid"]:
+        payload = docs_payload
+        payload_source = "deployment_openapi_example"
+    elif evidence["deployment_docs_example_repair_applied"]:
+        payload = repaired_docs_payload
+        payload_source = "deployment_openapi_example_repaired"
+    else:
+        evidence["deployment_fallback_payload_source"] = fallback_payload_source
+        if (
+            fallback_payload_source != "empty_fallback"
+            and (
+                int(evidence["deployment_docs_example_present"]) != 1
+                or int(evidence["deployment_docs_example_valid"]) != 1
+            )
+        ):
+            fallback_probe = probe_deployment_predict_payload_once(
+                evidence["deployment_predict_url"],
+                fallback_payload,
+            )
+            repaired_fallback_payload, repair_reason, repair_attempted = (
+                _deployment_repair_missing_required_field_aliases(
+                    fallback_payload,
+                    fallback_probe,
+                )
+            )
+            evidence["deployment_missing_field_repair_attempted"] = repair_attempted
+            evidence["deployment_missing_field_repair_reason"] = repair_reason
+            if repaired_fallback_payload is not None:
+                repaired_fallback_probe = probe_deployment_predict_payload_once(
+                    evidence["deployment_predict_url"],
+                    repaired_fallback_payload,
+                )
+                evidence["deployment_missing_field_repaired_status_code"] = (
+                    repaired_fallback_probe["status_code"]
+                )
+                if repaired_fallback_probe["valid"] == 1:
+                    evidence["deployment_missing_field_repair_succeeded"] = 1
+                    payload = repaired_fallback_payload
+                elif _deployment_docs_error_is_validation_like(repaired_fallback_probe):
+                    numeric_repaired_payload, numeric_repair_reason = _deployment_repair_numeric_docs_example(
+                        repaired_fallback_payload,
+                        repaired_fallback_probe,
+                    )
+                    evidence["deployment_composed_fallback_repair_attempted"] = 1
+                    if numeric_repaired_payload is not None:
+                        numeric_repaired_probe = probe_deployment_predict_payload_once(
+                            evidence["deployment_predict_url"],
+                            numeric_repaired_payload,
+                        )
+                        if numeric_repaired_probe["valid"] == 1:
+                            evidence["deployment_composed_fallback_repair_succeeded"] = 1
+                            evidence["deployment_composed_fallback_repair_reason"] = (
+                                "alias_then_numeric_success"
+                            )
+                            payload = numeric_repaired_payload
+                        else:
+                            evidence["deployment_composed_fallback_repair_reason"] = (
+                                "alias_success_numeric_failed"
+                            )
+                    else:
+                        evidence["deployment_composed_fallback_repair_reason"] = (
+                            "alias_failed_no_numeric_attempt"
+                            if numeric_repair_reason == "non_repairable_runtime_error"
+                            else "alias_success_numeric_failed"
+                        )
+
+    evidence["deployment_payload_source"] = payload_source
+
+    backoff_schedule = [0, 5, 15]
+    had_http_response = False
+    last_error_message = ""
+
+    for attempt_index, backoff_seconds in enumerate(backoff_schedule, start=1):
+        evidence["deployment_retry_count"] = attempt_index
+        if backoff_seconds:
+            time.sleep(backoff_seconds)
+
+        should_retry = False
+
+        try:
+            health_response = requests.get(evidence["deployment_health_url"], timeout=20)
+            evidence["deployment_health_status_code"] = health_response.status_code
+            evidence["deployment_response_excerpt"] = _deployment_text_excerpt(health_response.text)
+            had_http_response = True
+            if 200 <= health_response.status_code <= 499:
+                evidence["deployment_service_reachable"] = 1
+            if health_response.status_code == 200:
+                evidence["deployment_healthcheck_ok"] = 1
+            if health_response.status_code >= 500:
+                should_retry = True
+        except requests.RequestException as exc:
+            last_error_message = str(exc)
+            should_retry = True
+
+        try:
+            predict_response = requests.post(
+                evidence["deployment_predict_url"],
+                json=payload,
+                timeout=20,
+            )
+            evidence["deployment_predict_status_code"] = predict_response.status_code
+            evidence["deployment_response_excerpt"] = _deployment_text_excerpt(predict_response.text)
+            had_http_response = True
+            if 200 <= predict_response.status_code <= 499:
+                evidence["deployment_service_reachable"] = 1
+            if predict_response.status_code == 200 and payload_source != "empty_fallback":
+                evidence["deployment_predict_accepts_valid_json"] = 1
+                try:
+                    response_json = predict_response.json()
+                except ValueError:
+                    response_json = None
+                if response_json is not None and _deployment_response_has_valid_prediction(response_json):
+                    evidence["deployment_valid_prediction_response"] = 1
+                    evidence["deployment_response_excerpt"] = _deployment_text_excerpt(response_json)
+            if predict_response.status_code >= 500:
+                should_retry = True
+            else:
+                should_retry = False
+        except requests.RequestException as exc:
+            last_error_message = str(exc)
+            should_retry = should_retry or True
+
+        if evidence["deployment_service_reachable"] and not should_retry:
+            break
+        if attempt_index == len(backoff_schedule):
+            break
+
+    evidence["deployment_error_message"] = _deployment_text_excerpt(last_error_message)
+    evidence["deployment_timeout_flag"] = int(not had_http_response)
+    return evidence
+
+
+def _production_signal_files(repo_dir: Path) -> list[Path]:
+    candidates = [
+        repo_dir / "Dockerfile",
+        repo_dir / "render.yaml",
+        repo_dir / "render.yml",
+        repo_dir / "config.yaml",
+        repo_dir / "config.yml",
+    ]
+
+    workflow_dir = repo_dir / ".github" / "workflows"
+    if workflow_dir.exists():
+        candidates.extend(sorted(workflow_dir.glob("*.yml")))
+        candidates.extend(sorted(workflow_dir.glob("*.yaml")))
+
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for path in candidates:
+        if path.exists() and path not in seen:
+            existing.append(path)
+            seen.add(path)
+    return existing
+
+
+def _production_source_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bmodel_source\s*[:=]\s*[\"']?wandb[\"']?\b",
+        r"(?im)\bsource\s*:\s*wandb\b",
+        r"(?im)\binference\s*:\s*\n(?:[ \t].*\n)*?[ \t]+source\s*:\s*wandb\b",
+        r"(?im)\benv\s+model_source\s*=\s*[\"']?wandb[\"']?\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _production_prod_alias_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bwandb_model_alias\s*[:=]\s*[\"']?prod[\"']?\b",
+        r"(?im)\bmodel_alias\s*:\s*[\"']?prod[\"']?\b",
+        r"(?im)\bproduction_alias\s*:\s*[\"']?prod[\"']?\b",
+        r"(?im)\bartifact_alias\s*:\s*[\"']?prod[\"']?\b",
+        r"(?im)\benv\s+wandb_model_alias\s*=\s*[\"']?prod[\"']?\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _production_local_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bmodel_source\s*[:=]\s*[\"']?local[\"']?\b",
+        r"(?im)\bsource\s*:\s*local\b",
+        r"(?im)\binference\s*:\s*\n(?:[ \t].*\n)*?[ \t]+source\s*:\s*local\b",
+        r"(?im)\benv\s+model_source\s*=\s*[\"']?local[\"']?\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _deployment_api_start_signal(text: str) -> bool:
+    patterns = [
+        r"(?im)\bstartcommand\s*:\s*.*(?:uvicorn|gunicorn).*(?:src\.)?api:app\b",
+        r"(?im)\bcmd\b.*(?:uvicorn|gunicorn).*(?:src\.)?api:app\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _wandb_runtime_env_signal(text: str) -> bool:
+    keys = ["wandb_api_key", "wandb_entity", "wandb_project"]
+    return all(key in text.lower() for key in keys)
+
+
+def _runtime_registry_prod_wiring_signal(combined_cleaned: str, config_text: str) -> bool:
+    source_switch_present = bool(
+        re.search(r"os\.(?:getenv|environ\.get)\(\s*['\"]model_source['\"]", combined_cleaned)
+        and re.search(r"if\s+model_source\s*==\s*['\"]wandb['\"]", combined_cleaned)
+    )
+    return source_switch_present and _prod_alias_signal(combined_cleaned, config_text)
+
+
+def _runtime_registry_first_prod_signal(combined_cleaned: str, config_text: str) -> bool:
+    registry_first_patterns = [
+        r"try:\s*[\s\S]{0,400}use_artifact\s*\(",
+        r"try:\s*[\s\S]{0,400}wandb\.api\(\)\s*[\s\S]{0,200}artifact\s*\(",
+        r"attempting to load model from w&b artifact \(prod\)",
+    ]
+    registry_first = any(re.search(pattern, combined_cleaned, re.I) for pattern in registry_first_patterns)
+    local_fallback = bool(re.search(r"fall(?:ing)? back to local", combined_cleaned, re.I))
+    return registry_first and local_fallback and _prod_alias_signal(combined_cleaned, config_text)
+
+
+def _production_registry_selected(
+    repo_dir: Path,
+    combined_cleaned: str,
+    config_text: str,
+) -> bool:
+    env_keys_used = {
+        key
+        for key in ["model_source", "wandb_model_alias", "artifact_alias", "production_alias", "model_alias"]
+        if key in combined_cleaned
+    }
+
+    source_selected = False
+    alias_selected = False
+    local_selected = False
+    has_runtime_container = False
+    deployment_starts_api = False
+    deployment_has_wandb_runtime = False
+
+    for path in _production_signal_files(repo_dir):
+        sanitized_text = _strip_non_code_comments(read_text(path))
+        lower_text = sanitized_text.lower()
+
+        if path.name == ".env.example":
+            if not env_keys_used:
+                continue
+            if ".env.example" not in combined_cleaned and ".env.example" not in lower_text:
+                continue
+
+        if "workflow" in path.parts and not env_keys_used.intersection({"model_source", "wandb_model_alias", "artifact_alias", "production_alias", "model_alias"}):
+            continue
+
+        if path.name == "Dockerfile":
+            has_runtime_container = True
+        if _production_source_signal(sanitized_text):
+            source_selected = True
+        if _production_prod_alias_signal(sanitized_text):
+            alias_selected = True
+        if path.name != "ci.yml" and _production_local_signal(sanitized_text):
+            local_selected = True
+        if path.suffix in {".yaml", ".yml"} and _deployment_api_start_signal(sanitized_text):
+            deployment_starts_api = True
+        if path.suffix in {".yaml", ".yml"} and _wandb_runtime_env_signal(sanitized_text):
+            deployment_has_wandb_runtime = True
+
+    if not alias_selected and _production_prod_alias_signal(config_text):
+        alias_selected = True
+
+    if not source_selected and has_runtime_container and not local_selected and _runtime_registry_prod_wiring_signal(combined_cleaned, config_text):
+        source_selected = True
+        alias_selected = True
+
+    if (
+        not source_selected
+        and deployment_starts_api
+        and deployment_has_wandb_runtime
+        and _runtime_registry_first_prod_signal(combined_cleaned, config_text)
+    ):
+        source_selected = True
+        alias_selected = True
+
+    return source_selected and alias_selected
+
+
+def scan_model_registry(repo_dir: Path) -> dict[str, Any]:
+    evidence: dict[str, Any] = {
+        "reg_serving_path_registry_backed": 0,
+        "reg_serving_prod_alias_used": 0,
+        "reg_production_registry_selected": 0,
+        "reg_serving_local_fallback_present": 0,
+        "reg_serving_local_only": 0,
+        "reg_model_registry_cap_reason": "",
+    }
+
+    api_path = _find_api_path(repo_dir)
+    if not api_path or not api_path.exists():
+        evidence["reg_model_registry_cap_reason"] = "no_registry_serving_path"
+        return evidence
+
+    relevant_paths = [api_path, *_api_helper_paths(repo_dir, api_path)]
+    relevant_payloads: list[tuple[Path, str, str]] = []
+    for path in relevant_paths:
+        raw_text = read_text(path)
+        relevant_payloads.append((path, raw_text, _clean_python_for_detection(raw_text)))
+
+    api_raw_text = relevant_payloads[0][1]
+    combined_cleaned = "\n".join(cleaned for _, _, cleaned in relevant_payloads)
+    config_payload = _repo_config_payload(repo_dir)
+    config_text = _repo_config_text(repo_dir)
+
+    registry_any = any(_registry_serving_signal(cleaned) for _, _, cleaned in relevant_payloads)
+    local_any = any(_local_serving_signal(cleaned) for _, _, cleaned in relevant_payloads)
+    default_source = _default_source_from_code_and_config(combined_cleaned, config_payload)
+
+    registry_first_fallback = bool(
+        registry_any
+        and local_any
+        and "except" in api_raw_text
+        and "try" in api_raw_text
+        and "wandb" in combined_cleaned
+        and "local" in combined_cleaned
+    )
+
+    if default_source == "wandb" and registry_any:
+        evidence["reg_serving_path_registry_backed"] = 1
+    elif registry_first_fallback:
+        evidence["reg_serving_path_registry_backed"] = 1
+        evidence["reg_serving_local_fallback_present"] = 1
+    elif registry_any and not local_any:
+        evidence["reg_serving_path_registry_backed"] = 1
+    elif default_source == "local" and registry_any:
+        evidence["reg_serving_local_fallback_present"] = 1
+    elif local_any and not registry_any:
+        evidence["reg_serving_local_only"] = 1
+
+    if default_source == "local" and registry_any and local_any:
+        evidence["reg_serving_local_fallback_present"] = 1
+
+    if evidence["reg_serving_local_only"] == 0 and default_source == "local" and local_any and not registry_any:
+        evidence["reg_serving_local_only"] = 1
+
+    if evidence["reg_serving_path_registry_backed"]:
+        active_registry_text = combined_cleaned
+        evidence["reg_serving_prod_alias_used"] = int(_prod_alias_signal(active_registry_text, config_text))
+        evidence["reg_production_registry_selected"] = int(
+            _production_registry_selected(repo_dir, combined_cleaned, config_text)
+        )
+
+    cap_reasons: list[str] = []
+    if registry_any and len(relevant_paths) == 1 and api_path == relevant_paths[0]:
+        pass
+    elif not registry_any and any(_registry_serving_signal(_clean_python_for_detection(read_text(path))) for path in production_python_files(repo_dir) if path not in relevant_paths):
+        cap_reasons.append("registry_helper_not_used")
+    if not evidence["reg_serving_path_registry_backed"]:
+        cap_reasons.append("no_registry_serving_path")
+    if evidence["reg_serving_path_registry_backed"] and not evidence["reg_serving_prod_alias_used"]:
+        cap_reasons.append("missing_prod_alias")
+    if evidence["reg_serving_local_fallback_present"] and not evidence["reg_production_registry_selected"]:
+        cap_reasons.append("default_or_fallback_local")
+    if evidence["reg_serving_local_only"]:
+        cap_reasons.append("local_only")
+    evidence["reg_model_registry_cap_reason"] = "|".join(cap_reasons)
+    return evidence
 
 def _extract_import_targets(tree: ast.AST) -> list[str]:
     targets: list[str] = []
@@ -1507,6 +5485,222 @@ def list_pull_requests(owner: str, repo: str, cutoff_iso: str) -> list[dict[str,
     return collected
 
 
+def github_authenticated() -> int:
+    return int(bool(os.getenv("GITHUB_TOKEN", "").strip()))
+
+
+def github_workflow_defaults() -> dict[str, Any]:
+    return {
+        "ghwf_pr_to_main_signal": 0,
+        "ghwf_checks_evidence_signal": 0,
+        "ghwf_branch_hygiene_signal": 0,
+        "ghwf_default_branch_name": "",
+        "ghwf_total_prs_scanned": 0,
+        "ghwf_merged_prs_to_main": 0,
+        "ghwf_prs_with_status_evidence": 0,
+        "ghwf_prs_with_success_status": 0,
+        "ghwf_branch_count": 0,
+        "ghwf_non_main_non_dev_branch_count": 0,
+        "ghwf_github_api_used": 0,
+        "ghwf_github_api_authenticated": github_authenticated(),
+        "ghwf_cap_reason": "",
+    }
+
+
+def github_repo_metadata(owner: str, repo: str) -> dict[str, Any] | None:
+    payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}")
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def list_pull_requests_limited(
+    owner: str,
+    repo: str,
+    base_branch: str,
+    limit: int = 20,
+) -> list[dict[str, Any]] | None:
+    collected: list[dict[str, Any]] = []
+    page = 1
+
+    while len(collected) < limit:
+        per_page = min(100, limit - len(collected))
+        payload, _ = github_get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            {
+                "state": "closed",
+                "base": base_branch,
+                "sort": "created",
+                "direction": "desc",
+                "per_page": per_page,
+                "page": page,
+            },
+        )
+        if payload is None:
+            return None
+        if not isinstance(payload, list) or not payload:
+            break
+
+        for pr in payload:
+            collected.append(pr)
+            if len(collected) >= limit:
+                break
+
+        if len(payload) < per_page:
+            break
+        page += 1
+
+    return collected
+
+
+def list_branches(owner: str, repo: str) -> list[dict[str, Any]] | None:
+    collected: list[dict[str, Any]] = []
+    page = 1
+
+    while page <= 2:
+        payload, _ = github_get(
+            f"https://api.github.com/repos/{owner}/{repo}/branches",
+            {"per_page": 100, "page": page},
+        )
+        if payload is None:
+            return None
+        if not isinstance(payload, list) or not payload:
+            break
+
+        collected.extend(branch for branch in payload if isinstance(branch, dict))
+        if len(payload) < 100:
+            break
+        page += 1
+
+    return collected
+
+
+def commit_check_runs(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs")
+    if not isinstance(payload, dict):
+        return []
+    check_runs = payload.get("check_runs")
+    if not isinstance(check_runs, list):
+        return []
+    return [check for check in check_runs if isinstance(check, dict)]
+
+
+def commit_statuses(owner: str, repo: str, sha: str) -> list[dict[str, Any]]:
+    payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/status")
+    if not isinstance(payload, dict):
+        return []
+    statuses = payload.get("statuses")
+    if not isinstance(statuses, list):
+        return []
+    return [status for status in statuses if isinstance(status, dict)]
+
+
+def scan_github_workflow_discipline(
+    repo: RepoSpec,
+    cutoff_str: str,
+    timezone_name: str,
+) -> dict[str, Any]:
+    evidence = github_workflow_defaults()
+
+    if repo.repo_url.startswith("local://"):
+        return evidence
+
+    owner, repo_name = parse_owner_repo(repo.repo_url)
+    cutoff_dt = datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M:%S").replace(
+        tzinfo=ZoneInfo(timezone_name)
+    )
+    cutoff_iso = cutoff_dt.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    metadata = github_repo_metadata(owner, repo_name)
+    if not metadata:
+        evidence["ghwf_github_api_used"] = 1
+        if not evidence["ghwf_github_api_authenticated"]:
+            evidence["ghwf_cap_reason"] = "github_api_partial"
+        return evidence
+
+    evidence["ghwf_github_api_used"] = 1
+    default_branch = str(metadata.get("default_branch") or "").strip()
+    evidence["ghwf_default_branch_name"] = default_branch
+
+    # Edge case: scanning the most recently updated PRs across all branches can miss a valid
+    # merged PR to the default branch, so spend the 20-PR budget on closed default-branch PRs.
+    # Acceptable duplication: if version_control is also selected, this metric may fetch PRs again.
+    prs = list_pull_requests_limited(owner, repo_name, default_branch, limit=20)
+    if prs is None:
+        evidence["ghwf_cap_reason"] = "github_api_partial"
+        return evidence
+    evidence["ghwf_total_prs_scanned"] = len(prs)
+
+    merged_prs_to_main: list[dict[str, Any]] = []
+    for pr in prs:
+        base_ref = ((pr.get("base") or {}).get("ref") or "").strip()
+        merged_at = pr.get("merged_at")
+        if base_ref == default_branch and merged_at is not None and merged_at <= cutoff_iso:
+            merged_prs_to_main.append(pr)
+
+    evidence["ghwf_merged_prs_to_main"] = len(merged_prs_to_main)
+    evidence["ghwf_pr_to_main_signal"] = int(len(merged_prs_to_main) >= 1)
+
+    if not evidence["ghwf_pr_to_main_signal"]:
+        evidence["ghwf_cap_reason"] = "no_pr_to_main"
+
+    if evidence["ghwf_github_api_authenticated"]:
+        sample_prs = merged_prs_to_main[:3]
+        prs_with_status_evidence = 0
+        prs_with_success_status = 0
+
+        for pr in sample_prs:
+            sha = ((pr.get("head") or {}).get("sha") or "").strip()
+            if not sha:
+                continue
+
+            check_runs = commit_check_runs(owner, repo_name, sha)
+            statuses: list[dict[str, Any]] = []
+            if not check_runs:
+                statuses = commit_statuses(owner, repo_name, sha)
+
+            if check_runs or statuses:
+                prs_with_status_evidence += 1
+
+            if any(
+                (check.get("conclusion") or "").lower() == "success"
+                for check in check_runs
+            ) or any(
+                (status.get("state") or "").lower() == "success"
+                for status in statuses
+            ):
+                prs_with_success_status += 1
+
+        evidence["ghwf_prs_with_status_evidence"] = prs_with_status_evidence
+        evidence["ghwf_prs_with_success_status"] = prs_with_success_status
+        evidence["ghwf_checks_evidence_signal"] = int(prs_with_status_evidence >= 1)
+    else:
+        if evidence["ghwf_cap_reason"] != "no_pr_to_main":
+            evidence["ghwf_cap_reason"] = "github_api_partial"
+
+    branches = list_branches(owner, repo_name)
+    if branches is None:
+        if evidence["ghwf_cap_reason"] != "no_pr_to_main":
+            evidence["ghwf_cap_reason"] = "github_api_partial"
+        return evidence
+    evidence["ghwf_branch_count"] = len(branches)
+
+    non_main_non_dev_branch_count = 0
+    for branch in branches:
+        branch_name = str(branch.get("name") or "").strip().lower()
+        if not branch_name:
+            continue
+        if branch_name == default_branch.lower():
+            continue
+        if branch_name in {"dev", "development"}:
+            continue
+        non_main_non_dev_branch_count += 1
+
+    evidence["ghwf_non_main_non_dev_branch_count"] = non_main_non_dev_branch_count
+    evidence["ghwf_branch_hygiene_signal"] = int(non_main_non_dev_branch_count <= 5)
+    return evidence
+
+
 def list_reviews(owner: str, repo: str, pr_number: int, cutoff_iso: str) -> list[dict[str, Any]]:
     payload, _ = github_get(f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews")
     if not isinstance(payload, list):
@@ -1526,6 +5720,17 @@ def scan_github_workflow(
     cutoff_str: str,
     timezone_name: str,
 ) -> dict[str, Any]:
+    if repo.repo_url.startswith("local://"):
+        return {
+            "github_prs_found": 0,
+            "github_unique_pr_authors": 0,
+            "github_unique_reviewers": 0,
+            "github_approvals_found": 0,
+            "github_self_merge_ratio": None,
+            "github_api_used": 0,
+            "github_api_authenticated": int(bool(os.getenv("GITHUB_TOKEN", "").strip())),
+        }
+
     owner, repo_name = parse_owner_repo(repo.repo_url)
 
     cutoff_dt = datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M:%S").replace(
@@ -1580,12 +5785,82 @@ def scan_github_workflow(
     }
 
 
+def scan_release_discipline(
+    repo: RepoSpec,
+    cutoff_str: str,
+    timezone_name: str,
+) -> dict[str, Any]:
+    evidence = {
+        "release_found": 0,
+        "release_tag_name": "",
+        "release_target_commitish": "",
+        "release_targets_main": 0,
+        "release_is_prerelease": 0,
+        "release_is_draft": 0,
+        "release_count_found": 0,
+        "release_published_at_used": "",
+        "release_github_api_authenticated": github_authenticated(),
+        "release_cap_reason": "",
+    }
+
+    if repo.repo_url.startswith("local://"):
+        return evidence
+
+    owner, repo_name = parse_owner_repo(repo.repo_url)
+    api_url = f"https://api.github.com/repos/{owner}/{repo_name}/releases"
+    headers = github_headers()
+
+    try:
+        response = requests.get(api_url, headers=headers, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException:
+        return evidence
+    except ValueError:
+        return evidence
+
+    if not isinstance(payload, list):
+        return evidence
+
+    cutoff_utc = cutoff_datetime_utc(cutoff_str, timezone_name)
+
+    non_draft_releases = [
+        release for release in payload
+        if isinstance(release, dict) and not bool(release.get("draft", False))
+    ]
+    if not non_draft_releases:
+        return evidence
+
+    eligible_releases: list[dict[str, Any]] = []
+    for release in non_draft_releases:
+        published_at = parse_github_datetime(release.get("published_at"))
+        if published_at is not None and published_at <= cutoff_utc:
+            eligible_releases.append(release)
+
+    evidence["release_count_found"] = len(eligible_releases)
+    if not eligible_releases:
+        evidence["release_cap_reason"] = "release_after_cutoff"
+        return evidence
+
+    first_release = eligible_releases[0]
+    evidence["release_found"] = 1
+    evidence["release_tag_name"] = str(first_release.get("tag_name", "")).strip()
+    evidence["release_target_commitish"] = str(first_release.get("target_commitish", "")).strip()
+    evidence["release_targets_main"] = int(evidence["release_target_commitish"] == "main")
+    evidence["release_is_prerelease"] = int(bool(first_release.get("prerelease", False)))
+    evidence["release_is_draft"] = int(bool(first_release.get("draft", False)))
+    evidence["release_published_at_used"] = str(first_release.get("published_at", "")).strip()
+
+    return evidence
+
+
 def collect_evidence(
     repo_dir: Path,
     repo: RepoSpec,
     cutoff_str: str,
     timezone_name: str,
     selected_dimensions: set[str],
+    deployment_urls_file: str | Path | None = None,
 ) -> dict[str, Any]:
     evidence: dict[str, Any] = {}
 
@@ -1593,6 +5868,7 @@ def collect_evidence(
         "modularization",
         "documentation",
         "dependencies",
+        "config_reproducibility",
         "error_handling",
         "artifacting",
         "pipeline",
@@ -1611,8 +5887,56 @@ def collect_evidence(
         evidence.update(scan_artifact_contract(repo_dir))
         evidence.update(analyze_tests(repo_dir))
 
-    if _is_selected(selected_dimensions, "dependencies"):
+    if (
+        _is_selected(selected_dimensions, "dependencies")
+        or _is_selected(selected_dimensions, "config_reproducibility")
+    ):
         evidence.update(scan_dependency_files(repo_dir))
+
+    if _is_selected(selected_dimensions, "config_reproducibility"):
+        evidence.update(scan_config_reproducibility(repo_dir))
+
+    if _is_selected(selected_dimensions, "security_secrets"):
+        evidence.update(scan_security_secrets(repo_dir))
+
+    if _is_selected(selected_dimensions, "logging_observability"):
+        evidence.update(scan_logging_observability(repo_dir))
+
+    if _is_selected(selected_dimensions, "experiment_tracking"):
+        evidence.update(scan_experiment_tracking(repo_dir))
+
+    if _is_selected(selected_dimensions, "model_registry"):
+        evidence.update(scan_model_registry(repo_dir))
+
+    if _is_selected(selected_dimensions, "api_serving"):
+        evidence.update(scan_api_serving(repo_dir))
+
+    if _is_selected(selected_dimensions, "containerization"):
+        evidence.update(scan_containerization(repo_dir))
+
+    if _is_selected(selected_dimensions, "ci_cd"):
+        evidence.update(scan_ci_cd(repo_dir))
+
+    if _is_selected(selected_dimensions, "monitoring"):
+        evidence.update(scan_monitoring(repo_dir))
+
+    if _is_selected(selected_dimensions, "deployment"):
+        evidence.update(
+            scan_deployment(
+                repo_dir=repo_dir,
+                repo=repo,
+                deployment_urls_file=deployment_urls_file,
+            )
+        )
+
+    if _is_selected(selected_dimensions, "release_discipline"):
+        evidence.update(
+            scan_release_discipline(
+                repo,
+                cutoff_str=cutoff_str,
+                timezone_name=timezone_name,
+            )
+        )
 
     if _is_selected(selected_dimensions, "code_quality"):
         evidence.update(run_ruff(repo_dir))
@@ -1632,7 +5956,106 @@ def collect_evidence(
             )
         )
 
+    if _is_selected(selected_dimensions, "github_workflow_discipline"):
+        evidence.update(
+            scan_github_workflow_discipline(
+                repo=repo,
+                cutoff_str=cutoff_str,
+                timezone_name=timezone_name,
+            )
+        )
+
     return evidence
+
+
+def _deployment_docs_penalty_reason(evidence: dict[str, Any]) -> str:
+    if int(evidence.get("deployment_docs_example_present", 0)) != 1:
+        error_text = str(evidence.get("deployment_docs_example_error", "")).strip()
+        if error_text == "openapi_example_unparseable":
+            return "openapi_example_unparseable"
+        return "no_openapi_example"
+
+    if int(evidence.get("deployment_docs_example_valid", 0)) == 1:
+        return ""
+
+    status_code = str(evidence.get("deployment_docs_example_predict_status_code", "")).strip()
+    if status_code == "422":
+        return "openapi_example_422"
+    if status_code == "500":
+        return "openapi_example_500"
+
+    error_text = str(evidence.get("deployment_docs_example_error", "")).strip()
+    if error_text == "openapi_example_unparseable":
+        return "openapi_example_unparseable"
+
+    return "wrong_openapi_example"
+
+
+def _deployment_live_payload_strategy(evidence: dict[str, Any]) -> str:
+    if int(evidence.get("deployment_service_reachable", 0)) != 1:
+        return "service_unreachable"
+
+    if int(evidence.get("deployment_valid_prediction_response", 0)) == 1:
+        if int(evidence.get("deployment_composed_fallback_repair_succeeded", 0)) == 1:
+            return "fallback_alias_then_numeric_repaired_success"
+        if int(evidence.get("deployment_missing_field_repair_succeeded", 0)) == 1:
+            return "fallback_missing_field_repaired_success"
+        if int(evidence.get("deployment_docs_example_present", 0)) == 1:
+            if int(evidence.get("deployment_docs_example_repair_applied", 0)) == 1:
+                return "docs_repaired_success"
+            if int(evidence.get("deployment_docs_example_valid", 0)) == 1:
+                return "docs_only_success"
+            fallback_source = str(evidence.get("deployment_fallback_payload_source", "")).strip()
+            if fallback_source and fallback_source != "missing":
+                return "docs_failed_fallback_success"
+            return "docs_failed_no_fallback_success"
+
+        payload_source = str(evidence.get("deployment_payload_source", "")).strip()
+        if payload_source and payload_source != "empty_fallback":
+            return "no_docs_fallback_success"
+        return "no_payload_reachable_only"
+
+    payload_source = str(evidence.get("deployment_payload_source", "")).strip()
+    if payload_source == "empty_fallback" or not payload_source:
+        return "no_payload_reachable_only"
+
+    if int(evidence.get("deployment_docs_example_present", 0)) == 1:
+        return "docs_and_fallback_failed"
+
+    return "no_payload_reachable_only"
+
+
+def _deployment_comment_text(evidence: dict[str, Any]) -> str:
+    if int(evidence.get("deployment_public_url_present", 0)) != 1:
+        return "Public deployment URL is missing"
+
+    if int(evidence.get("deployment_service_reachable", 0)) != 1:
+        return "Deployment did not respond to the live probe"
+
+    if int(evidence.get("deployment_valid_prediction_response", 0)) == 1:
+        if int(evidence.get("deployment_composed_fallback_repair_succeeded", 0)) == 1:
+            return "Live deployment works, but the documented `/predict` example needs field and value fixes"
+        if int(evidence.get("deployment_missing_field_repair_succeeded", 0)) == 1:
+            return "Live deployment works, but the documented `/predict` example uses wrong field names"
+        if int(evidence.get("deployment_docs_example_present", 0)) == 1:
+            if int(evidence.get("deployment_docs_example_repair_applied", 0)) == 1:
+                return "Live deployment works, but the documented `/predict` example required a numeric fix"
+            if int(evidence.get("deployment_docs_example_valid", 0)) == 1:
+                return "Live deployment and the documented `/predict` example both work"
+            return "Live deployment works, but the documented `/predict` example fails"
+        return "Live deployment works, but no `/predict` example could be validated"
+
+    payload_source = str(evidence.get("deployment_payload_source", "")).strip()
+    if payload_source == "empty_fallback":
+        return "Service is reachable, but no valid payload was available for `/predict`"
+
+    if int(evidence.get("deployment_healthcheck_ok", 0)) == 1:
+        return "Health check works, but live inference fails"
+
+    if int(evidence.get("deployment_predict_accepts_valid_json", 0)) == 1:
+        return "Service accepts requests, but the prediction response is invalid"
+
+    return "Service is reachable, but `/predict` could not be validated"
 
 
 def compute_proxy_scores(
@@ -1736,6 +6159,329 @@ def compute_proxy_scores(
             else 0.0
         )
         scores[DIMENSION_TO_SCORE_COLUMN["dependencies"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "config_reproducibility"):
+        section = cfg_get(config, "scoring.config_reproducibility", {})
+
+        signal_names = [
+            "config_yaml_present",
+            "config_yaml_has_keys",
+            "environment_yml_present",
+            "conda_lock_yml_present",
+            "main_reads_config_signal",
+            "env_contract_signal",
+            "gitignore_excludes_env",
+            "dotenv_usage_signal",
+        ]
+
+        score = 0.0
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        runtime_config_keys_found = int(evidence.get("runtime_config_keys_found", 0) or 0)
+        if runtime_config_keys_found >= int(cfg_get(section, "runtime_config_keys_min", 0)):
+            score += safe_float(cfg_get(section, "runtime_config_keys_points", 0.0))
+
+        path_hits = int(evidence.get("code_hardcoded_path_hits", 0) or 0)
+        hyperparam_hits = int(evidence.get("code_hardcoded_hyperparam_hits", 0) or 0)
+
+        score -= min(
+            safe_float(cfg_get(section, "hardcoded_path_penalty_cap", 0.0)),
+            path_hits * safe_float(cfg_get(section, "hardcoded_path_penalty", 0.0)),
+        )
+        score -= min(
+            safe_float(cfg_get(section, "hardcoded_hyperparam_penalty_cap", 0.0)),
+            hyperparam_hits * safe_float(cfg_get(section, "hardcoded_hyperparam_penalty", 0.0)),
+        )
+
+        cap_reasons: list[str] = []
+        if not int(evidence.get("config_yaml_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_config_yaml_cap", 10.0)))
+            cap_reasons.append("missing_config_yaml")
+
+        if not int(evidence.get("conda_lock_yml_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_conda_lock_cap", 10.0)))
+            cap_reasons.append("missing_conda_lock")
+
+        if int(evidence.get("secret_like_literal_hits", 0) or 0) > 0:
+            score = min(score, safe_float(cfg_get(section, "secret_literal_cap", 10.0)))
+            cap_reasons.append("secret_like_literal")
+
+        evidence["config_reproducibility_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["config_reproducibility"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "security_secrets"):
+        section = cfg_get(config, "scoring.security_secrets", {})
+
+        score = 0.0
+
+        if int(evidence.get("sec_gitignore_excludes_env", 0) or 0):
+            score += safe_float(cfg_get(section, "sec_gitignore_excludes_env", 0.0))
+
+        if int(evidence.get("sec_dockerignore_excludes_env", 0) or 0):
+            score += safe_float(cfg_get(section, "sec_dockerignore_excludes_env", 0.0))
+
+        if int(evidence.get("sec_secret_literal_hits", 0) or 0) == 0:
+            score += safe_float(cfg_get(section, "sec_no_secret_literals", 0.0))
+
+        cap_reasons: list[str] = []
+
+        if int(evidence.get("sec_env_file_tracked_by_git", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "sec_tracked_env_cap", 2.0)))
+            cap_reasons.append("env_tracked_in_git")
+
+        if int(evidence.get("sec_secret_literal_hits", 0) or 0) > 0:
+            score = min(score, safe_float(cfg_get(section, "sec_secret_literal_cap", 4.0)))
+            cap_reasons.append("secret_literals_found")
+
+        if evidence.get("sec_tracked_env_like_files", ""):
+            score = min(score, safe_float(cfg_get(section, "sec_tracked_env_like_files_cap", 5.0)))
+            cap_reasons.append("env_like_files_tracked")
+
+        evidence["security_secrets_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["security_secrets"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "logging_observability"):
+        section = cfg_get(config, "scoring.logging_observability", {})
+
+        score = 0.0
+
+        if int(evidence.get("log_print_free", 0) or 0):
+            score += safe_float(cfg_get(section, "log_print_free", 0.0))
+
+        if int(evidence.get("log_logger_module_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_logger_module_present", 0.0))
+
+        if int(evidence.get("log_file_handler_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_file_handler_present", 0.0))
+
+        if int(evidence.get("log_stream_handler_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_stream_handler_present", 0.0))
+
+        if int(evidence.get("log_dual_output_signal", 0) or 0):
+            score += safe_float(cfg_get(section, "log_dual_output_signal", 0.0))
+
+        if int(evidence.get("log_logfile_path_present", 0) or 0):
+            score += safe_float(cfg_get(section, "log_logfile_path_present", 0.0))
+
+        if int(evidence.get("log_logger_usage_signal", 0) or 0):
+            score += safe_float(cfg_get(section, "log_logger_usage_signal", 0.0))
+
+        cap_reasons: list[str] = []
+        allowed_print_calls = int(cfg_get(section, "print_calls_allowed", 3))
+        print_hits = int(evidence.get("log_print_statement_hits", 0) or 0)
+
+        if print_hits > allowed_print_calls:
+            score = min(score, safe_float(cfg_get(section, "too_many_print_calls_cap", 5.0)))
+            cap_reasons.append("too_many_print_calls")
+
+        if int(evidence.get("log_logger_module_fallback_used", 0) or 0):
+            score -= safe_float(cfg_get(section, "fallback_logger_module_penalty", 1.0))
+
+        if not int(evidence.get("log_logger_module_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_logger_module_cap", 4.0)))
+            cap_reasons.append("missing_logger_module")
+
+        if not int(evidence.get("log_dual_output_signal", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_dual_output_cap", 6.0)))
+            cap_reasons.append("missing_dual_output")
+
+        if not int(evidence.get("log_logger_usage_signal", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_usage_cap", 8.0)))
+            cap_reasons.append("missing_usage")
+
+        evidence["logging_observability_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["logging_observability"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "experiment_tracking"):
+        section = cfg_get(config, "scoring.experiment_tracking", {})
+
+        score = 0.0
+
+        if int(evidence.get("wandb_import_present", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_import_present", 0.0))
+        if int(evidence.get("wandb_init_in_main", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_init_in_main", 0.0))
+        if int(evidence.get("wandb_config_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_config_logged", 0.0))
+        if int(evidence.get("wandb_run_metadata_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_run_metadata_logged", 0.0))
+        if int(evidence.get("wandb_eval_metrics_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_eval_metrics_logged", 0.0))
+        if int(evidence.get("wandb_rich_eval_tracking_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_rich_eval_tracking_logged", 0.0))
+        if int(evidence.get("wandb_model_artifact_logged", 0) or 0):
+            score += safe_float(cfg_get(section, "wandb_model_artifact_logged", 0.0))
+
+        cap_reasons: list[str] = []
+
+        if not int(evidence.get("wandb_init_in_main", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_wandb_init_in_main_cap", 4.0)))
+            cap_reasons.append("missing_wandb_init_in_main")
+
+        if not int(evidence.get("wandb_eval_metrics_logged", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_eval_metrics_cap", 7.0)))
+            cap_reasons.append("missing_eval_metrics")
+
+        if not int(evidence.get("wandb_model_artifact_logged", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_model_artifact_cap", 8.0)))
+            cap_reasons.append("missing_model_artifact")
+
+        evidence["wandb_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["experiment_tracking"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "model_registry"):
+        section = cfg_get(config, "scoring.model_registry", {})
+
+        score = 0.0
+        production_override_enabled = bool(cfg_get(section, "production_override_enabled", True))
+        registry_backed = int(evidence.get("reg_serving_path_registry_backed", 0) or 0)
+        prod_alias_used = int(evidence.get("reg_serving_prod_alias_used", 0) or 0)
+        production_selected = int(evidence.get("reg_production_registry_selected", 0) or 0)
+        local_fallback = int(evidence.get("reg_serving_local_fallback_present", 0) or 0)
+        local_only = int(evidence.get("reg_serving_local_only", 0) or 0)
+
+        if registry_backed:
+            score += safe_float(cfg_get(section, "reg_serving_path_registry_backed", 0.0))
+        if prod_alias_used:
+            score += safe_float(cfg_get(section, "reg_serving_prod_alias_used", 0.0))
+
+        caps: list[float] = []
+        reasons: list[str] = []
+        if local_only:
+            caps.append(safe_float(cfg_get(section, "local_only_cap", 0.0)))
+            reasons.append("local_only")
+        if not registry_backed:
+            caps.append(safe_float(cfg_get(section, "missing_registry_serving_cap", 2.0)))
+            reasons.append("no_registry_serving_path")
+        if not prod_alias_used:
+            caps.append(safe_float(cfg_get(section, "missing_prod_alias_cap", 7.0)))
+            reasons.append("missing_prod_alias")
+        if local_fallback and not (production_override_enabled and production_selected):
+            caps.append(safe_float(cfg_get(section, "local_fallback_cap", 7.0)))
+            reasons.append("default_or_fallback_local")
+
+        if caps:
+            score = min(score, min(caps))
+
+        evidence["reg_model_registry_cap_reason"] = "|".join(reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["model_registry"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "api_serving"):
+        section = cfg_get(config, "scoring.api_serving", {})
+
+        score = 0.0
+        signal_names = [
+            "api_fastapi_app_present",
+            "api_pydantic_contract_present",
+            "api_health_endpoint_present",
+            "api_predict_endpoint_present",
+            "api_uvicorn_serving_present",
+        ]
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        if not int(evidence.get("api_fastapi_app_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "no_fastapi_app_cap", 0.0)))
+            evidence["api_serving_cap_reason"] = "no_fastapi_app"
+        elif not int(evidence.get("api_predict_endpoint_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_predict_endpoint_cap", 5.0)))
+            evidence["api_serving_cap_reason"] = "missing_predict_endpoint"
+        elif not int(evidence.get("api_predict_calls_inference_logic", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "predict_without_inference_logic_cap", 7.0)))
+            evidence["api_serving_cap_reason"] = "predict_without_inference_logic"
+        else:
+            evidence["api_serving_cap_reason"] = ""
+
+        scores[DIMENSION_TO_SCORE_COLUMN["api_serving"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "containerization"):
+        section = cfg_get(config, "scoring.containerization", {})
+
+        score = 0.0
+        signal_names = [
+            "dockerfile_present",
+            "docker_serving_entrypoint_present",
+            "dockerignore_present",
+            "dockerignore_quality_signal",
+            "docker_reproducible_install_signal",
+        ]
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        if not int(evidence.get("dockerfile_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "no_dockerfile_cap", 0.0)))
+            evidence["containerization_cap_reason"] = "no_dockerfile"
+        elif not int(evidence.get("docker_serving_entrypoint_present", 0) or 0):
+            score = min(
+                score,
+                safe_float(cfg_get(section, "non_serving_docker_entrypoint_cap", 5.0)),
+            )
+            evidence["containerization_cap_reason"] = "non_serving_docker_entrypoint"
+        elif not int(evidence.get("dockerignore_present", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_dockerignore_cap", 6.0)))
+            evidence["containerization_cap_reason"] = "missing_dockerignore"
+        else:
+            evidence["containerization_cap_reason"] = ""
+
+        scores[DIMENSION_TO_SCORE_COLUMN["containerization"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "ci_cd"):
+        section = cfg_get(config, "scoring.ci_cd", {})
+
+        score = 0.0
+        signal_names = [
+            "ci_workflow_present",
+            "ci_triggers_on_pr",
+            "ci_runs_validation_steps",
+        ]
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        cap_reasons: list[str] = []
+        if not int(evidence.get("ci_triggers_on_pr", 0) or 0):
+            score = min(score, safe_float(cfg_get(section, "missing_pr_trigger_cap", 5.0)))
+            cap_reasons.append("missing_pr_trigger")
+
+        evidence["ci_cd_cap_reason"] = "|".join(cap_reasons)
+        scores[DIMENSION_TO_SCORE_COLUMN["ci_cd"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "monitoring"):
+        section = cfg_get(config, "scoring.monitoring", {})
+
+        score = 0.0
+        signal_names = [
+            "monitoring_local_runtime_log_signal",
+            "monitoring_api_request_trace_signal",
+            "monitoring_api_logging_signal",
+            "monitoring_wandb_inference_telemetry_signal",
+            "monitoring_healthcheck_signal",
+        ]
+        for signal_name in signal_names:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        evidence["monitoring_cap_reason"] = ""
+        scores[DIMENSION_TO_SCORE_COLUMN["monitoring"]] = round2(clamp(score))
+
+    if _is_selected(selected_dimensions, "deployment"):
+        section = cfg_get(config, "scoring.deployment", {})
+
+        score = 0.0
+        for signal_name in [
+            "deployment_public_url_present",
+            "deployment_service_reachable",
+            "deployment_predict_accepts_valid_json",
+            "deployment_valid_prediction_response",
+        ]:
+            if int(evidence.get(signal_name, 0) or 0):
+                score += safe_float(cfg_get(section, signal_name, 0.0))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["deployment"]] = round2(clamp(score))
 
     if _is_selected(selected_dimensions, "error_handling"):
         section = cfg_get(config, "scoring.error_handling", {})
@@ -1856,6 +6602,67 @@ def compute_proxy_scores(
 
         scores[DIMENSION_TO_SCORE_COLUMN["version_control"]] = round2(score)
 
+    if _is_selected(selected_dimensions, "release_discipline"):
+        release_score_col = DIMENSION_TO_SCORE_COLUMN["release_discipline"]
+        release_found_points = safe_float(
+            cfg_get(config, "scoring.release_discipline.release_found_points", 5.0),
+            5.0,
+        )
+        release_targets_main_points = safe_float(
+            cfg_get(config, "scoring.release_discipline.release_targets_main_points", 5.0),
+            5.0,
+        )
+        scores[release_score_col] = round2(
+            release_found_points * int(evidence.get("release_found", 0))
+            + release_targets_main_points * int(evidence.get("release_targets_main", 0))
+        )
+
+    if _is_selected(selected_dimensions, "deployment"):
+        evidence["deployment_live_payload_strategy"] = _deployment_live_payload_strategy(evidence)
+        evidence["deployment_docs_penalty_reason"] = _deployment_docs_penalty_reason(evidence)
+
+        deployment_score_col = DIMENSION_TO_SCORE_COLUMN["deployment"]
+        wrong_docs_example_penalty = safe_float(
+            cfg_get(config, "scoring.deployment.wrong_docs_example_penalty", 2.0),
+            2.0,
+        )
+        if (
+            int(evidence.get("deployment_valid_prediction_response", 0)) == 1
+            and (
+                (
+                    int(evidence.get("deployment_docs_example_present", 0)) == 1
+                    and int(evidence.get("deployment_docs_example_valid", 0)) == 0
+                    and evidence.get("deployment_live_payload_strategy") == "docs_failed_fallback_success"
+                )
+                or evidence.get("deployment_live_payload_strategy")
+                == "fallback_missing_field_repaired_success"
+                or evidence.get("deployment_live_payload_strategy")
+                == "fallback_alias_then_numeric_repaired_success"
+            )
+        ):
+            current_score = safe_float(scores.get(deployment_score_col, 0.0))
+            scores[deployment_score_col] = round2(clamp(current_score - wrong_docs_example_penalty))
+
+    if _is_selected(selected_dimensions, "github_workflow_discipline"):
+        section = cfg_get(config, "scoring.github_workflow_discipline", {})
+        pr_to_main_signal = int(evidence.get("ghwf_pr_to_main_signal", 0) or 0)
+        checks_evidence_signal = int(evidence.get("ghwf_checks_evidence_signal", 0) or 0)
+        branch_hygiene_signal = int(evidence.get("ghwf_branch_hygiene_signal", 0) or 0)
+        cap_reason = str(evidence.get("ghwf_cap_reason", "") or "")
+
+        score = 0.0
+        if pr_to_main_signal:
+            score += safe_float(cfg_get(section, "ghwf_pr_to_main_signal", 0.0))
+        if checks_evidence_signal:
+            score += safe_float(cfg_get(section, "ghwf_checks_evidence_signal", 0.0))
+        if branch_hygiene_signal:
+            score += safe_float(cfg_get(section, "ghwf_branch_hygiene_signal", 0.0))
+
+        if cap_reason == "no_pr_to_main":
+            score = min(score, safe_float(cfg_get(section, "no_pr_to_main_cap", 3.0)))
+
+        scores[DIMENSION_TO_SCORE_COLUMN["github_workflow_discipline"]] = round2(clamp(score))
+
     return scores
 
 
@@ -1863,6 +6670,7 @@ def make_dimension_comments(
     evidence: dict[str, Any],
     scores: dict[str, float],
     selected_dimensions: set[str],
+    repo_dir: Path | None = None,
 ) -> dict[str, str]:
     comments: dict[str, str] = {}
 
@@ -1954,6 +6762,357 @@ def make_dimension_comments(
             comments["dependency_management_comment"] = "No environment.yml or conda.yml file was found"
     else:
         comments["dependency_management_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "config_reproducibility"):
+        config_yaml_present = int(evidence.get("config_yaml_present", 0) or 0)
+        conda_lock_present = int(evidence.get("conda_lock_yml_present", 0) or 0)
+        main_reads_config = int(evidence.get("main_reads_config_signal", 0) or 0)
+        path_hits = int(evidence.get("code_hardcoded_path_hits", 0) or 0)
+        hyperparam_hits = int(evidence.get("code_hardcoded_hyperparam_hits", 0) or 0)
+        secret_hits = int(evidence.get("secret_like_literal_hits", 0) or 0)
+
+        missing_items: list[str] = []
+        if not config_yaml_present:
+            missing_items.append("missing config.yaml")
+        if not conda_lock_present:
+            missing_items.append("missing conda-lock.yml")
+        if not main_reads_config:
+            missing_items.append("main.py does not clearly read config")
+        if path_hits > 0:
+            missing_items.append("hardcoded paths remain")
+        if hyperparam_hits > 0:
+            missing_items.append("hardcoded hyperparameters remain")
+        if secret_hits > 0:
+            missing_items.append("secret-like literals remain")
+
+        if not missing_items:
+            comments["config_reproducibility_comment"] = "Runtime settings are centralized and the environment setup is reproducibility-friendly"
+        else:
+            comments["config_reproducibility_comment"] = (
+                "Config reproducibility gaps: " + "; ".join(missing_items)
+            )
+    else:
+        comments["config_reproducibility_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "security_secrets"):
+        gitignore_ok = int(evidence.get("sec_gitignore_excludes_env", 0) or 0)
+        dockerignore_ok = int(evidence.get("sec_dockerignore_excludes_env", 0) or 0)
+        dockerignore_present = int(evidence.get("sec_dockerignore_present", 0) or 0)
+        env_tracked = int(evidence.get("sec_env_file_tracked_by_git", 0) or 0)
+        secret_hits = int(evidence.get("sec_secret_literal_hits", 0) or 0)
+        tracked_env_like = evidence.get("sec_tracked_env_like_files", "")
+
+        missing_items: list[str] = []
+        if env_tracked:
+            missing_items.append(".env tracked in git")
+        if tracked_env_like:
+            missing_items.append("env-like files tracked")
+        if secret_hits > 0:
+            missing_items.append("secret literals found")
+        if not gitignore_ok:
+            missing_items.append(".gitignore does not clearly exclude .env")
+        if not dockerignore_present:
+            missing_items.append(".dockerignore missing")
+        elif not dockerignore_ok:
+            missing_items.append(".dockerignore does not exclude .env")
+
+        if gitignore_ok and dockerignore_ok and secret_hits == 0 and not env_tracked and not tracked_env_like:
+            comments["security_secrets_comment"] = ".env is excluded from both git and Docker and no secret literals were found"
+        else:
+            comments["security_secrets_comment"] = "Security/secrets gaps: " + "; ".join(missing_items)
+    else:
+        comments["security_secrets_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "logging_observability"):
+        allowed_print_calls = 3
+        print_hits = int(evidence.get("log_print_statement_hits", 0) or 0)
+        print_files = evidence.get("log_print_hit_files", "")
+        logger_present = int(evidence.get("log_logger_module_present", 0) or 0)
+        dual_output = int(evidence.get("log_dual_output_signal", 0) or 0)
+        file_handler = int(evidence.get("log_file_handler_present", 0) or 0)
+        stream_handler = int(evidence.get("log_stream_handler_present", 0) or 0)
+        usage_signal = int(evidence.get("log_logger_usage_signal", 0) or 0)
+        suffix = f" in: {print_files}" if print_files else ""
+
+        missing_items: list[str] = []
+        if not logger_present:
+            missing_items.append("src/logger.py missing")
+        if not file_handler:
+            missing_items.append("file handler missing")
+        if not stream_handler:
+            missing_items.append("stream/console handler missing")
+        if not usage_signal:
+            missing_items.append("logger not clearly used in production modules")
+        if print_hits > allowed_print_calls:
+            missing_items.append(f"print calls exceed allowed cleanup slack{suffix}")
+        elif print_hits > 0:
+            missing_items.append(f"print calls remain within allowed cleanup slack{suffix}")
+        if int(evidence.get("log_logger_module_fallback_used", 0) or 0):
+            missing_items.append("logging.py used instead of expected logger.py")
+
+        if not missing_items:
+            comments["logging_observability_comment"] = (
+                "Logging is production-ready: dual-output, used across production modules, and within the allowed print cleanup slack"
+            )
+        else:
+            comments["logging_observability_comment"] = "Logging gaps: " + "; ".join(missing_items)
+    else:
+        comments["logging_observability_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "experiment_tracking"):
+        init_present = int(evidence.get("wandb_init_in_main", 0) or 0)
+        config_logged = int(evidence.get("wandb_config_logged", 0) or 0)
+        metadata_present = int(evidence.get("wandb_run_metadata_logged", 0) or 0)
+        metrics_present = int(evidence.get("wandb_eval_metrics_logged", 0) or 0)
+        rich_tracking_present = int(evidence.get("wandb_rich_eval_tracking_logged", 0) or 0)
+        model_artifact_present = int(evidence.get("wandb_model_artifact_logged", 0) or 0)
+        wandb_log_in_helper = False
+
+        if not metrics_present and repo_dir is not None:
+            for path in production_python_files(repo_dir):
+                if path == _find_main_path(repo_dir):
+                    continue
+                cleaned = _clean_python_for_detection(read_text(path))
+                if "wandb.log(" in cleaned:
+                    wandb_log_in_helper = True
+                    break
+
+        missing_items: list[str] = []
+        if not metadata_present:
+            missing_items.append(
+                "run-level metadata is not clearly logged to W&B (e.g. dataset size, split info, selected model, entrypoint, or model artifact path)"
+            )
+        if not metrics_present:
+            if wandb_log_in_helper:
+                missing_items.append(
+                    "Evaluation metrics are logged in a helper module rather than orchestrated from main.py. The rubric requires W&B tracking to be centrally owned by main.py."
+                )
+            else:
+                missing_items.append(
+                    "evaluation metrics are not clearly logged to W&B (e.g. metrics/, validation/test metrics, rmse, mae, accuracy, f1, precision, recall, or auc)"
+                )
+        if not rich_tracking_present:
+            missing_items.append(
+                "richer W&B evaluation tracking is missing (e.g. tables, plots, confusion matrix, ROC/PR curves, or comparison tables)"
+            )
+        if not model_artifact_present:
+            missing_items.append("model artifact logging not clearly evidenced")
+
+        if not init_present:
+            missing_items.insert(0, "W&B not clearly initialized from main.py")
+        if not config_logged:
+            missing_items.append("full config/hyperparameters not passed to wandb.init (config= missing)")
+
+        if (
+            init_present
+            and config_logged
+            and metadata_present
+            and metrics_present
+            and rich_tracking_present
+            and model_artifact_present
+        ):
+            comments["experiment_tracking_comment"] = (
+                "W&B tracking is centrally initialized and captures run metadata, evaluation evidence, and model artifacts"
+            )
+        else:
+            comments["experiment_tracking_comment"] = (
+                "Experiment tracking gaps: " + "; ".join(missing_items)
+            )
+    else:
+        comments["experiment_tracking_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "model_registry"):
+        registry_backed = int(evidence.get("reg_serving_path_registry_backed", 0) or 0)
+        prod_alias_used = int(evidence.get("reg_serving_prod_alias_used", 0) or 0)
+        production_selected = int(evidence.get("reg_production_registry_selected", 0) or 0)
+        local_fallback = int(evidence.get("reg_serving_local_fallback_present", 0) or 0)
+        local_only = int(evidence.get("reg_serving_local_only", 0) or 0)
+
+        if local_only:
+            comments["model_registry_comment"] = (
+                "Serving loads a local unmanaged model file and no registry-backed serving path is clearly active"
+            )
+        elif registry_backed and not prod_alias_used and local_fallback:
+            comments["model_registry_comment"] = (
+                "Serving has a W&B registry branch, but defaults to a local model and does not clearly use the prod alias"
+            )
+        elif registry_backed and prod_alias_used and production_selected and local_fallback:
+            comments["model_registry_comment"] = (
+                "Production serving loads W&B prod first, but local fallback remains in the API"
+            )
+        elif registry_backed and prod_alias_used and not local_fallback:
+            comments["model_registry_comment"] = (
+                "API supports W&B prod registry serving, and deployment wiring is sufficient to treat it as the production path"
+            )
+        elif registry_backed and not prod_alias_used:
+            comments["model_registry_comment"] = (
+                "API has a W&B registry load path, but the serving alias is not clearly set to prod"
+            )
+        elif registry_backed and prod_alias_used and local_fallback:
+            comments["model_registry_comment"] = (
+                "API can load W&B prod, but serving still defaults to a local unmanaged model"
+            )
+        else:
+            comments["model_registry_comment"] = (
+                "Registry use is not clearly evidenced in the serving path"
+            )
+    else:
+        comments["model_registry_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "api_serving"):
+        fastapi_app_present = int(evidence.get("api_fastapi_app_present", 0) or 0)
+        pydantic_contract_present = int(evidence.get("api_pydantic_contract_present", 0) or 0)
+        health_endpoint_present = int(evidence.get("api_health_endpoint_present", 0) or 0)
+        predict_endpoint_present = int(evidence.get("api_predict_endpoint_present", 0) or 0)
+        uvicorn_serving_present = int(evidence.get("api_uvicorn_serving_present", 0) or 0)
+        predict_calls_inference_logic = int(evidence.get("api_predict_calls_inference_logic", 0) or 0)
+
+        if not fastapi_app_present:
+            comments["api_serving_comment"] = "No FastAPI app found"
+        elif not predict_endpoint_present:
+            comments["api_serving_comment"] = "/predict route missing"
+        elif not predict_calls_inference_logic:
+            comments["api_serving_comment"] = "/predict handles inference inline instead of delegating to a serving helper"
+        elif not pydantic_contract_present:
+            comments["api_serving_comment"] = "Pydantic request model not evident on /predict"
+        elif not uvicorn_serving_present:
+            comments["api_serving_comment"] = "Uvicorn entrypoint not evident"
+        elif health_endpoint_present and predict_endpoint_present:
+            comments["api_serving_comment"] = "FastAPI `/health` and `/predict` are wired through a serving helper"
+        else:
+            comments["api_serving_comment"] = "/health route missing"
+    else:
+        comments["api_serving_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "containerization"):
+        cap_reason = evidence.get("containerization_cap_reason", "")
+        dockerignore_quality = int(evidence.get("dockerignore_quality_signal", 0) or 0)
+        reproducible_install = int(evidence.get("docker_reproducible_install_signal", 0) or 0)
+        excluded_noise_count = int(evidence.get("dockerignore_excluded_noise_count", 0) or 0)
+
+        if cap_reason == "no_dockerfile":
+            comments["containerization_comment"] = (
+                "No root Dockerfile is present, so containerized serving is not evidenced."
+            )
+        elif cap_reason == "non_serving_docker_entrypoint":
+            comments["containerization_comment"] = (
+                "Dockerfile exists, but the default container entrypoint does not clearly start the serving API."
+            )
+        elif cap_reason == "missing_dockerignore":
+            comments["containerization_comment"] = (
+                "Dockerfile exists, but .dockerignore is missing, so lean image boundaries are not evidenced."
+            )
+        elif not dockerignore_quality:
+            comments["containerization_comment"] = (
+                f"Serving Dockerfile is present, but .dockerignore excludes only part of the expected noise set ({excluded_noise_count}/7)."
+            )
+        elif not reproducible_install:
+            comments["containerization_comment"] = (
+                "Dockerfile clearly serves the API and .dockerignore is lean; reproducible lockfile install is not clearly evidenced."
+            )
+        else:
+            comments["containerization_comment"] = (
+                "Dockerfile clearly serves the API, .dockerignore is lean, and the image install is lockfile-based."
+            )
+    else:
+        comments["containerization_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "ci_cd"):
+        ci_present = int(evidence.get("ci_workflow_present", 0) or 0)
+        ci_pr = int(evidence.get("ci_triggers_on_pr", 0) or 0)
+        ci_validation = int(evidence.get("ci_runs_validation_steps", 0) or 0)
+        cd_present = int(evidence.get("cd_workflow_present", 0) or 0)
+        cd_release_only = int(evidence.get("cd_triggered_by_release_only", 0) or 0)
+
+        if ci_present and ci_pr and ci_validation and cd_present and cd_release_only:
+            comments["ci_cd_comment"] = "CI validates pull requests; a release-gated deploy workflow is also present"
+        elif ci_present and ci_pr and ci_validation:
+            comments["ci_cd_comment"] = "CI validates pull requests"
+        elif not ci_present:
+            comments["ci_cd_comment"] = "No CI workflow found"
+        elif not ci_pr:
+            comments["ci_cd_comment"] = "CI workflow does not trigger on pull requests"
+        elif not ci_validation:
+            comments["ci_cd_comment"] = "CI workflow lacks clear validation steps"
+        else:
+            comments["ci_cd_comment"] = "No CI workflow found"
+    else:
+        comments["ci_cd_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "monitoring"):
+        local_runtime_log = int(evidence.get("monitoring_local_runtime_log_signal", 0) or 0)
+        request_trace = int(evidence.get("monitoring_api_request_trace_signal", 0) or 0)
+        api_logging = int(evidence.get("monitoring_api_logging_signal", 0) or 0)
+        wandb_inference = int(evidence.get("monitoring_wandb_inference_telemetry_signal", 0) or 0)
+        healthcheck = int(evidence.get("monitoring_healthcheck_signal", 0) or 0)
+        render_documented = int(evidence.get("monitoring_render_runtime_documented", 0) or 0)
+
+        signal_items = [
+            ("monitoring_local_runtime_log_signal", "runtime logs", local_runtime_log),
+            ("monitoring_api_request_trace_signal", "request tracing", request_trace),
+            ("monitoring_api_logging_signal", "API logging", api_logging),
+            ("monitoring_wandb_inference_telemetry_signal", "inference telemetry", wandb_inference),
+            ("monitoring_healthcheck_signal", "health visibility", healthcheck),
+        ]
+        present_count = sum(value for _, _, value in signal_items)
+
+        missing_priority = [
+            ("monitoring_api_request_trace_signal", "request tracing"),
+            ("monitoring_wandb_inference_telemetry_signal", "inference telemetry"),
+            ("monitoring_local_runtime_log_signal", "runtime logs"),
+            ("monitoring_api_logging_signal", "API logging"),
+            ("monitoring_healthcheck_signal", "health visibility"),
+        ]
+        missing_items = [
+            label
+            for signal_name, label in missing_priority
+            if not int(evidence.get(signal_name, 0) or 0)
+        ]
+
+        def _format_missing_items(items: list[str]) -> str:
+            if len(items) == 1:
+                return items[0]
+            if len(items) == 2:
+                return f"{items[0]} and {items[1]}"
+            return f"{items[0]}, {items[1]}, and {items[2]}"
+
+        if present_count == 5:
+            comments["monitoring_comment"] = "Runtime logs, tracing, API logging, inference telemetry, and health checks are evidenced"
+        elif present_count >= 1:
+            comments["monitoring_comment"] = f"Monitoring missing: {_format_missing_items(missing_items[:3])}"
+        elif render_documented:
+            comments["monitoring_comment"] = "Render or health monitoring is documented, but runtime monitoring was not verified"
+        else:
+            comments["monitoring_comment"] = "Runtime monitoring signals are missing"
+    else:
+        comments["monitoring_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "deployment"):
+        public_url_present = int(evidence.get("deployment_public_url_present", 0) or 0)
+        service_reachable = int(evidence.get("deployment_service_reachable", 0) or 0)
+        payload_source = str(evidence.get("deployment_payload_source", "") or "")
+        healthcheck_ok = int(evidence.get("deployment_healthcheck_ok", 0) or 0)
+        predict_accepts = int(evidence.get("deployment_predict_accepts_valid_json", 0) or 0)
+        valid_response = int(evidence.get("deployment_valid_prediction_response", 0) or 0)
+        checked_at_utc = str(evidence.get("deployment_checked_at_utc", "") or "")
+
+        if not public_url_present:
+            comments["deployment_comment"] = "Public deployment URL is missing"
+        elif not service_reachable:
+            timestamp_suffix = f" at {checked_at_utc}" if checked_at_utc else ""
+            comments["deployment_comment"] = f"Deployment did not respond to the live probe{timestamp_suffix}"
+        elif payload_source in {"missing", "empty_fallback"}:
+            comments["deployment_comment"] = "Service is reachable, but no valid payload was available for `/predict`"
+        elif healthcheck_ok and not predict_accepts:
+            comments["deployment_comment"] = "Health check works, but live inference fails"
+        elif not predict_accepts:
+            comments["deployment_comment"] = "Service is reachable, but prediction requests fail"
+        elif not valid_response:
+            comments["deployment_comment"] = "Service accepts requests, but the prediction response is invalid"
+        else:
+            comments["deployment_comment"] = "Live deployment returns valid predictions"
+    else:
+        comments["deployment_comment"] = skipped()
 
     if _is_selected(selected_dimensions, "error_handling"):
         function_present = int(evidence.get("validation_function_present", 0) or 0)
@@ -2056,9 +7215,68 @@ def make_dimension_comments(
     else:
         comments["version_control_workflow_comment"] = skipped()
 
-    ran_comments = [value for key, value in comments.items() if key.endswith("_comment") and value != "SKIPPED"]
-    if ran_comments:
-        comments["overall_comment"] = "First-pass qualitative feedback generated from the selected rubric dimensions"
+    if _is_selected(selected_dimensions, "github_workflow_discipline"):
+        score = safe_float(scores.get(DIMENSION_TO_SCORE_COLUMN["github_workflow_discipline"], 0.0))
+        merged_prs_to_main = int(evidence.get("ghwf_merged_prs_to_main", 0) or 0)
+        checks_evidence_signal = int(evidence.get("ghwf_checks_evidence_signal", 0) or 0)
+        branch_hygiene_signal = int(evidence.get("ghwf_branch_hygiene_signal", 0) or 0)
+        github_authenticated_flag = int(evidence.get("ghwf_github_api_authenticated", 0) or 0)
+
+        if not github_authenticated_flag:
+            if merged_prs_to_main >= 1 or checks_evidence_signal or branch_hygiene_signal:
+                comments["github_workflow_discipline_comment"] = (
+                    "GitHub workflow evidence is partial because `GITHUB_TOKEN` is missing"
+                )
+            else:
+                comments["github_workflow_discipline_comment"] = (
+                    "GitHub workflow could not be fully verified because `GITHUB_TOKEN` is missing"
+                )
+        elif score >= 10.0:
+            comments["github_workflow_discipline_comment"] = "PRs to main, checks evidence, and branch hygiene are all evidenced"
+        elif score >= 8.0:
+            comments["github_workflow_discipline_comment"] = "PRs to main and branch hygiene are evidenced; checks evidence is limited"
+        elif score >= 6.0:
+            comments["github_workflow_discipline_comment"] = "PRs to main are evidenced, but checks evidence or branch hygiene is partial"
+        elif 3.0 <= score <= 4.0:
+            comments["github_workflow_discipline_comment"] = "Only limited PR-to-main workflow evidence was found"
+        else:
+            comments["github_workflow_discipline_comment"] = "GitHub workflow discipline could not be fully verified"
+    else:
+        comments["github_workflow_discipline_comment"] = skipped()
+
+    if _is_selected(selected_dimensions, "release_discipline"):
+        release_found = int(evidence.get("release_found", 0) or 0)
+        release_targets_main = int(evidence.get("release_targets_main", 0) or 0)
+        release_cap_reason = str(evidence.get("release_cap_reason", "") or "")
+        github_authenticated_flag = int(evidence.get("release_github_api_authenticated", 0) or 0)
+
+        if release_found != 1 and release_cap_reason == "release_after_cutoff":
+            comments["release_discipline_comment"] = "No GitHub Release published on or before the cutoff was found"
+        elif release_found != 1:
+            comments["release_discipline_comment"] = "No qualifying GitHub Release was found"
+        elif release_targets_main != 1:
+            comments["release_discipline_comment"] = "A pre-cutoff release was found, but it does not target `main`"
+        elif not github_authenticated_flag:
+            comments["release_discipline_comment"] = "A pre-cutoff release to `main` was found; GitHub verification was unauthenticated"
+        else:
+            comments["release_discipline_comment"] = "A pre-cutoff release targeting `main` was found"
+
+    if _is_selected(selected_dimensions, "deployment"):
+        comments["deployment_comment"] = _deployment_comment_text(evidence)
+
+    scored_gap_dimensions: list[str] = []
+    for dimension in sorted(selected_dimensions):
+        score_col = DIMENSION_TO_SCORE_COLUMN.get(dimension)
+        if not score_col:
+            continue
+        score = scores.get(score_col)
+        if isinstance(score, (int, float)) and float(score) < 10.0:
+            scored_gap_dimensions.append(dimension)
+
+    if scored_gap_dimensions:
+        comments["overall_comment"] = "Gaps flagged in: " + ", ".join(scored_gap_dimensions[:4])
+    elif any(value != "SKIPPED" for key, value in comments.items() if key.endswith("_comment")):
+        comments["overall_comment"] = "No clear automated gaps were flagged in the selected dimensions"
     else:
         comments["overall_comment"] = "No rubric dimensions were selected for this run"
 
